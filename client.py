@@ -49,7 +49,9 @@ connection = pika.BlockingConnection(
         port=5672,
         virtual_host=f"{virtual_host}",
         credentials=credentials,
-        heartbeat=3600,
+        heartbeat=0,                # disable heartbeats: long CPU inference blocks
+                                    # the pika thread for seconds, which would
+                                    # otherwise trip a heartbeat-timeout disconnect.
         blocked_connection_timeout=600
     )
 )

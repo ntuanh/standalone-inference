@@ -14,7 +14,7 @@ import pika.exceptions
 from src.Compress import Encoder,Decoder
 import src.Log as Log
 from src.Model import inference, postprocess_yolo
-from src.Utils import get_intermediate_queue_args
+from src.Utils import get_intermediate_queue_args, get_bbox_queue_args
 
 # Fixed cap on intermediate_queue depth (messages) before an edge waits.
 # Only only_cloud sends large raw frames (~150MB/msg), which can blow up
@@ -48,7 +48,7 @@ class Scheduler:
         # intermediate_queue so they don't skew the routing depth check.
         self.bbox_queue = "bbox_queue"
         self.channel.queue_declare(self.bbox_queue, durable=False,
-                                   arguments=get_intermediate_queue_args())
+                                   arguments=get_bbox_queue_args())
         self._my_metrics_queue = None  # set by _setup_metrics_fanout_queue
         # Publisher confirms (enabled lazily on the edge in first_layer) let the
         # broker NACK a publish that hit the reject-publish overflow ceiling, so
@@ -131,7 +131,13 @@ class Scheduler:
                 Log.print_with_color(
                     f"[Overflow] '{queue_name}' full — broker rejected publish "
                     f"(reject-publish). Waiting for cloud to drain...", "yellow")
-                time.sleep(0.1)
+                # Use connection.sleep (not time.sleep) so heartbeats / socket I-O
+                # keep flowing while we block — otherwise pika's BlockingConnection
+                # goes silent and the broker resets it (StreamLostError).
+                try:
+                    self.channel.connection.sleep(0.1)
+                except Exception:
+                    time.sleep(0.1)
 
     def write_metrics(self, mode, role, best_cut, batch_id, batch_size, latency_ms, fps, ram_mb, message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None, inference_path=""):
         file_path = f"metrics_raw_{self.intermediate_queue}_{str(self.client_id).replace('-', '')}.csv"

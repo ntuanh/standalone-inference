@@ -7,7 +7,7 @@ import pika
 import pickle
 import src.Model
 import src.Log
-from src.Utils import get_intermediate_queue_args
+from src.Utils import get_intermediate_queue_args, get_bbox_queue_args
 from ultralytics import YOLO
 
 from src.Clustering import (
@@ -55,7 +55,8 @@ class Server:
                 port=5672,
                 virtual_host=f"{self.virtual_host}",
                 credentials=credentials,
-                heartbeat=3600,
+                heartbeat=0,                # disable heartbeats (long inference
+                                            # blocks the pika thread for seconds)
                 blocked_connection_timeout=600
             )
         )
@@ -74,7 +75,7 @@ class Server:
         # Kept separate from intermediate_queue so its depth doesn't pollute the
         # edge's "is the cloud backed up?" routing signal.
         self.channel.queue_declare(queue='bbox_queue', durable=False,
-                                   arguments=get_intermediate_queue_args(config))
+                                   arguments=get_bbox_queue_args(config))
         self.channel.queue_purge(queue='bbox_queue')
 
         self.register_clients = [0 for _ in range(len(self.total_clients))]

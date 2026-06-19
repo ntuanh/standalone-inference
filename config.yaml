@@ -22,13 +22,17 @@ rabbit:
   username: "machine-1"
   password: "123456"
   virtual-host: /
-  # Broker-level overflow protection on intermediate_queue (and per-cluster
-  # intermediate_queue_k). When the queue depth reaches max-queue-messages the
-  # broker rejects further publishes (x-overflow: reject-publish) and NACKs the
-  # edge publisher; the edge then waits for the cloud to drain and retries, so
-  # no frame is lost and broker RAM stays bounded (~max-queue-messages * msg).
-  # Set to 0 / remove to disable. Keep >= the client-side cap (MAX_QUEUE_ONLY_CLOUD).
+  # Broker-level overflow protection (x-overflow: reject-publish). When a queue
+  # hits its cap the broker rejects further publishes and NACKs the edge, which
+  # waits for the cloud to drain and retries — no message lost, broker RAM bounded.
+  # Set a cap to 0 / remove to disable that queue's limit.
+  #
+  # intermediate_queue: heavy, carries raw image batches (~MB each). Cap small.
+  #   broker RAM for this queue ≈ max-queue-messages × per-message size.
   max-queue-messages: 5
+  # bbox_queue: light, carries edge-computed bboxes (~KB text). Cap can be deep.
+  #   If unset, falls back to max-queue-messages.
+  bbox-max-queue-messages: 100
   overflow: reject-publish
 
 debug-mode: False

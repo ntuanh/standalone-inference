@@ -7,35 +7,50 @@ import numpy as np
 import cv2
 
 
-def get_intermediate_queue_args(config=None):
-    """Build the RabbitMQ arguments dict that enforces broker-level overflow
-    protection on intermediate_queue / intermediate_queue_k.
-
-    Returns ``{'x-max-length': N, 'x-overflow': 'reject-publish'}`` so the broker
-    bounds queue depth at N messages and rejects (NACKs) further publishes once
-    full, instead of buffering large frames until it runs out of RAM.
-
-    Every queue_declare for these queues MUST pass the *same* arguments, or
-    RabbitMQ raises PRECONDITION_FAILED and closes the channel. Routing all
-    declares through this helper guarantees that consistency. Returns ``None``
-    (no limit) when max-queue-messages is unset/0, which keeps queue_declare
-    backward compatible with an un-bounded queue.
-
-    Pass ``config`` when it's already loaded (server); otherwise the edge/cloud
-    Scheduler calls it with no args and it reads config.yaml directly.
-    """
+def _load_config(config):
+    """Return the given config dict, or read config.yaml when called with None
+    (the edge/cloud Scheduler doesn't carry the config object around)."""
     if config is None:
         import yaml
         with open('config.yaml', 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
-    rabbit = config.get('rabbit', {}) or {}
-    max_len = rabbit.get('max-queue-messages')
+    return config
+
+
+def _overflow_args(max_len, overflow):
+    """Build a RabbitMQ arguments dict that enforces broker-level overflow:
+    ``{'x-max-length': N, 'x-overflow': 'reject-publish'}``. The broker bounds
+    the queue at N messages and rejects (NACKs) further publishes once full,
+    instead of buffering until it runs out of RAM. Returns ``None`` (no limit)
+    when max_len is unset/0, keeping queue_declare backward compatible.
+
+    NOTE: every queue_declare for the *same* queue MUST pass identical arguments,
+    or RabbitMQ raises PRECONDITION_FAILED and closes the channel. So a given
+    queue must always be declared via the same getter below."""
     if not max_len:
         return None
     return {
         'x-max-length': int(max_len),
-        'x-overflow': rabbit.get('overflow', 'reject-publish'),
+        'x-overflow': overflow,
     }
+
+
+def get_intermediate_queue_args(config=None):
+    """Overflow args for intermediate_queue / intermediate_queue_k — the heavy
+    queue carrying raw image batches (~MB each). Capped by `max-queue-messages`."""
+    rabbit = _load_config(config).get('rabbit', {}) or {}
+    return _overflow_args(rabbit.get('max-queue-messages'),
+                          rabbit.get('overflow', 'reject-publish'))
+
+
+def get_bbox_queue_args(config=None):
+    """Overflow args for bbox_queue — the light queue carrying edge-computed
+    bboxes (~KB each, text). Capped by `bbox-max-queue-messages`, which can be
+    much deeper than the image queue for the same RAM. Falls back to
+    `max-queue-messages` if the bbox-specific key is unset."""
+    rabbit = _load_config(config).get('rabbit', {}) or {}
+    max_len = rabbit.get('bbox-max-queue-messages', rabbit.get('max-queue-messages'))
+    return _overflow_args(max_len, rabbit.get('overflow', 'reject-publish'))
 
 
 def delete_old_queues(address, username, password, virtual_host):

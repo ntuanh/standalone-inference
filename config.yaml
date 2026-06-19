@@ -28,7 +28,7 @@ rabbit:
   # edge publisher; the edge then waits for the cloud to drain and retries, so
   # no frame is lost and broker RAM stays bounded (~max-queue-messages * msg).
   # Set to 0 / remove to disable. Keep >= the client-side cap (MAX_QUEUE_ONLY_CLOUD).
-  max-queue-messages: 15
+  max-queue-messages: 5
   overflow: reject-publish
 
 debug-mode: False

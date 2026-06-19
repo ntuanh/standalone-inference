@@ -8,10 +8,13 @@ import csv
 import os
 import psutil
 import numpy as np
+import pika
+import pika.exceptions
 
 from src.Compress import Encoder,Decoder
 import src.Log as Log
 from src.Model import inference, postprocess_yolo
+from src.Utils import get_intermediate_queue_args
 
 # Fixed cap on intermediate_queue depth (messages) before an edge waits.
 # Only only_cloud sends large raw frames (~150MB/msg), which can blow up
@@ -39,8 +42,18 @@ class Scheduler:
 
         self.size_message = None
         self.intermediate_queue = f"intermediate_queue"
-        self.channel.queue_declare(self.intermediate_queue, durable=False)
+        self.channel.queue_declare(self.intermediate_queue, durable=False,
+                                   arguments=get_intermediate_queue_args())
+        # adaptive mode only: edge-computed bboxes go here, kept off
+        # intermediate_queue so they don't skew the routing depth check.
+        self.bbox_queue = "bbox_queue"
+        self.channel.queue_declare(self.bbox_queue, durable=False,
+                                   arguments=get_intermediate_queue_args())
         self._my_metrics_queue = None  # set by _setup_metrics_fanout_queue
+        # Publisher confirms (enabled lazily on the edge in first_layer) let the
+        # broker NACK a publish that hit the reject-publish overflow ceiling, so
+        # _publish_intermediate can wait+retry instead of silently dropping it.
+        self._confirms_enabled = False
 
         self.map_metric = None
         self.gt_dict = {}
@@ -63,6 +76,15 @@ class Scheduler:
         process = psutil.Process(os.getpid())
         return process.memory_info().rss / (1024 * 1024)
 
+    def _get_queue_depth(self, queue_name):
+        """Number of ready messages in queue_name (passive declare = read-only).
+        Used by adaptive routing: depth 0 on intermediate_queue means the cloud
+        is keeping up, so the next batch can be offloaded for full cloud YOLO."""
+        try:
+            return self.channel.queue_declare(queue_name, passive=True).method.message_count
+        except Exception:
+            return 0
+
     def _check_backpressure(self):
         max_queue = MAX_QUEUE_ONLY_CLOUD
         depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
@@ -77,7 +99,41 @@ class Scheduler:
         Log.print_with_color(
             f"[BackPressure] '{self.intermediate_queue}' depth={depth} < max_queue={max_queue}, resuming", "green")
 
-    def write_metrics(self, mode, role, best_cut, batch_id, batch_size, latency_ms, fps, ram_mb, message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None):
+    def _enable_publisher_confirms(self):
+        """Turn the edge publish channel into confirm mode so the broker tells us
+        (via basic.nack) when a publish is rejected by the reject-publish overflow
+        policy. Idempotent — safe to call once per run."""
+        if self._confirms_enabled:
+            return
+        try:
+            self.channel.confirm_delivery()
+            self._confirms_enabled = True
+        except Exception as e:
+            # Confirms already on, or broker doesn't support them — fall back to
+            # the depth-poll back-pressure, which still bounds the queue.
+            Log.print_with_color(f"[Overflow] confirm_delivery() not enabled: {e}", "yellow")
+
+    def _publish_intermediate(self, queue_name, body):
+        """Publish one batch to intermediate_queue with broker overflow handling.
+
+        With publisher confirms on and the queue declared 'x-overflow:
+        reject-publish', a publish that would exceed 'x-max-length' is NACKed by
+        the broker (pika raises NackError) and the message is NOT enqueued. We
+        treat that as back-pressure: wait for the cloud to drain, then retry —
+        so the frame is never lost. Mirrors the depth-poll _check_backpressure,
+        but uses the broker as the source of truth and works in every mode
+        (split / only_edge / only_cloud), not just only_cloud."""
+        while True:
+            try:
+                self.channel.basic_publish(exchange='', routing_key=queue_name, body=body)
+                return
+            except (pika.exceptions.NackError, pika.exceptions.UnroutableError):
+                Log.print_with_color(
+                    f"[Overflow] '{queue_name}' full — broker rejected publish "
+                    f"(reject-publish). Waiting for cloud to drain...", "yellow")
+                time.sleep(0.1)
+
+    def write_metrics(self, mode, role, best_cut, batch_id, batch_size, latency_ms, fps, ram_mb, message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None, inference_path=""):
         file_path = f"metrics_raw_{self.intermediate_queue}_{str(self.client_id).replace('-', '')}.csv"
         file_exists = os.path.exists(file_path)
 
@@ -97,6 +153,7 @@ class Scheduler:
                     "message_size_bytes",
                     "e2e_latency_ms",
                     "edge_start_time",
+                    "inference_path",
                 ])
 
             writer.writerow([
@@ -111,6 +168,7 @@ class Scheduler:
                 message_size_bytes,
                 round(e2e_latency_ms, 3),
                 edge_start_time if edge_start_time is not None else "",
+                inference_path,
             ])
 
     def _setup_metrics_fanout_queue(self):
@@ -143,13 +201,7 @@ class Scheduler:
         })
         self.size_message = len(message)
 
-
-        self.channel.basic_publish(
-            exchange='',
-            routing_key=intermediate_queue,
-            body=message,
-            #body= "."
-        )
+        self._publish_intermediate(intermediate_queue, message)
 
     def _load_gt_dict(self, gt_dir="datasets/groundtruth"):
         if not os.path.isdir(gt_dir):
@@ -242,6 +294,9 @@ class Scheduler:
 
     def first_layer(self, model, data, batch_size, splits, logger, compress, mode="split", save_set=None):
         input_image = []
+        # Edge is the only publisher to intermediate_queue → enable confirms so a
+        # reject-publish overflow NACK surfaces in _publish_intermediate.
+        self._enable_publisher_confirms()
         if mode != "only_cloud":
             model.eval()
             model.to(self.device)
@@ -279,15 +334,17 @@ class Scheduler:
 
                 _stack_start = time.perf_counter()
                 input_image = torch.stack(input_image)
-                if mode != "only_cloud":
-                    # only_cloud: edge does no GPU inference, keep frames on CPU
-                    # to avoid a wasted CPU->GPU->CPU round trip before sending.
+                if mode not in ("only_cloud", "adaptive"):
+                    # only_cloud / adaptive: edge may skip GPU inference (cloud path),
+                    # so keep frames on CPU and move to device only if we route locally,
+                    # avoiding a wasted CPU->GPU->CPU round trip before sending.
                     input_image = input_image.to(self.device)
                 stack_ms = (time.perf_counter() - _stack_start) * 1000
 
                 inference_ms = 0.0
                 queue_wait_ms = 0.0
                 send_ms = 0.0
+                route_path = None   # adaptive: "split" (cloud) or "edge_only"
 
                 # ===== ONLY CLOUD =====
                 if mode == "only_cloud":
@@ -344,8 +401,62 @@ class Scheduler:
                     }
                     body = pickle.dumps({"action": "OUTPUT", "data": payload})
                     self.size_message = len(body)
-                    self.channel.basic_publish(exchange='', routing_key=self.intermediate_queue, body=body)
+                    self._publish_intermediate(self.intermediate_queue, body)
                     send_ms = (time.perf_counter() - _send_start) * 1000
+
+                # ===== ADAPTIVE (full cloud  OR  full edge, decided per batch) =====
+                elif mode == "adaptive":
+                    depth = self._get_queue_depth(self.intermediate_queue)
+                    if depth == 0:
+                        # --- Cloud has capacity → offload raw frames (full cloud YOLO) ---
+                        route_path = "split"
+                        frames_cpu = input_image  # still on CPU
+                        y = {
+                            "data": [frames_cpu[i].clone() for i in range(len(frames_cpu))],
+                            "width": width,
+                            "height": height,
+                            "edge_start_time": edge_start_wall,
+                        }
+                        _wait_start = time.perf_counter()
+                        self._check_backpressure()
+                        queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
+
+                        _send_start = time.perf_counter()
+                        self.send_next_layer(self.intermediate_queue, y, {"enable": False})
+                        send_ms = (time.perf_counter() - _send_start) * 1000
+                    else:
+                        # --- Cloud backlogged → run full YOLO locally, ship bboxes ---
+                        route_path = "edge_only"
+                        input_image = input_image.to(self.device)
+
+                        _inf_start = time.perf_counter()
+                        y = []
+                        with torch.no_grad():
+                            x, y = inference(model, input_image, y, 0, save_set)
+                        inference_ms = (time.perf_counter() - _inf_start) * 1000
+
+                        results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
+                        map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
+                        self._update_map(results, batch_id, batch_size, map_results=map_results)
+
+                        _send_start = time.perf_counter()
+                        payload = {
+                            "width": width,
+                            "height": height,
+                            "results": [
+                                {
+                                    "boxes":   r["boxes"].cpu().numpy(),
+                                    "scores":  r["scores"].cpu().numpy(),
+                                    "classes": r["classes"].cpu().numpy(),
+                                }
+                                for r in results
+                            ],
+                            "edge_start_time": edge_start_wall,
+                        }
+                        body = pickle.dumps({"action": "OUTPUT", "data": payload})
+                        self.size_message = len(body)
+                        self._publish_intermediate(self.bbox_queue, body)
+                        send_ms = (time.perf_counter() - _send_start) * 1000
 
                 # ===== SPLIT INFERENCE =====
                 else:
@@ -380,10 +491,18 @@ class Scheduler:
                 ram_ms = (time.perf_counter() - _ram_start) * 1000
                 msg_size = self.size_message if self.size_message is not None else 0
 
+                if mode == "adaptive":
+                    # split route → edge only sent frames; edge_only → edge ran YOLO.
+                    edge_role = "edge_sender" if route_path == "split" else "edge"
+                elif mode == "only_cloud":
+                    edge_role = "edge_sender"
+                else:
+                    edge_role = "edge"
+
                 _write_start = time.perf_counter()
                 self.write_metrics(
                     mode=mode,
-                    role="edge_sender" if mode == "only_cloud" else "edge",
+                    role=edge_role,
                     best_cut="N/A" if splits is None else splits,
                     batch_id=batch_id,
                     batch_size=batch_size,
@@ -393,6 +512,7 @@ class Scheduler:
                     message_size_bytes=msg_size,
                     e2e_latency_ms=e2e_latency_ms,
                     edge_start_time=edge_start_wall,
+                    inference_path=route_path or "",
                 )
                 write_ms = (time.perf_counter() - _write_start) * 1000
 
@@ -465,6 +585,12 @@ class Scheduler:
             print(str(time.time_ns()) + " start", file=_tf)
         while True:
             method_frame, header_frame, body = self.channel.basic_get(queue=self.intermediate_queue, auto_ack=True)
+            src_queue = "intermediate"
+            # adaptive: if no raw batch to run, drain edge-computed bboxes (metrics only).
+            # intermediate_queue is checked first so cloud YOLO always has priority.
+            if not (method_frame and body) and mode == "adaptive":
+                method_frame, header_frame, body = self.channel.basic_get(queue=self.bbox_queue, auto_ack=True)
+                src_queue = "bbox"
             if method_frame and body:
                 t_batch_ready = time.perf_counter()
                 gap_ms = (t_batch_ready - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
@@ -476,12 +602,23 @@ class Scheduler:
                 y = received_data["data"]
                 edge_start_time = y.get("edge_start_time", time.time())
 
+                # adaptive routes per message: a raw batch on intermediate_queue runs
+                # full cloud YOLO ('split'); a bbox message on bbox_queue is metrics
+                # only ('edge_only'). eff maps it onto the existing only_cloud/only_edge
+                # code paths; cloud_path is the inference_path label for metrics.
+                if mode == "adaptive":
+                    eff = "only_cloud" if src_queue == "intermediate" else "only_edge"
+                    cloud_path = "split" if src_queue == "intermediate" else "edge_only"
+                else:
+                    eff = mode
+                    cloud_path = ""
+
                 # ===== ONLY EDGE (cloud just receives lightweight results) =====
-                if mode == "only_edge":
+                if eff == "only_edge":
                     decode_ms = 0.0
                     inference_ms = 0.0
                 # ===== ONLY CLOUD =====
-                elif mode == "only_cloud":
+                elif eff == "only_cloud":
                     _decode_start = time.perf_counter()
                     input_tensor = y["data"]
 
@@ -521,7 +658,7 @@ class Scheduler:
                         x, _ = inference(model, x, list_output, splits, save_set)
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
 
-                if mode == "only_edge":
+                if eff == "only_edge":
                     postprocess_ms = 0.0
                 else:
                     _post_start = time.perf_counter()
@@ -554,6 +691,7 @@ class Scheduler:
                     message_size_bytes=received_message_size,
                     e2e_latency_ms=e2e_latency_ms,
                     edge_start_time=edge_start_time,
+                    inference_path=cloud_path,
                 )
                 write_ms = (time.perf_counter() - _write_start) * 1000
 
@@ -676,7 +814,7 @@ class Scheduler:
 
         n_rows = len(matched_pairs)
         fieldnames = [
-            "batch_id", "batch_size", "best_cut",
+            "batch_id", "batch_size", "best_cut", "inference_path",
             "edge_device", "edge_latency_ms", "edge_fps", "edge_ram_mb", "edge_message_size_bytes",
             "cloud_device", "cloud_arrival_order", "cloud_latency_ms", "cloud_fps", "cloud_ram_mb", "cloud_message_size_bytes",
             "e2e_latency_ms",
@@ -690,6 +828,7 @@ class Scheduler:
                     "batch_id":                i,
                     "batch_size":              e.get("batch_size") or c.get("batch_size", ""),
                     "best_cut":                e.get("best_cut")   or c.get("best_cut", ""),
+                    "inference_path":          e.get("inference_path") or c.get("inference_path", ""),
                     "edge_device":             e.get("device_seq", ""),
                     "edge_latency_ms":         e.get("latency_ms", ""),
                     "edge_fps":                e.get("fps", ""),
@@ -769,7 +908,8 @@ class Scheduler:
     def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None):
         if queue_name != self.intermediate_queue:
             self.intermediate_queue = queue_name
-            self.channel.queue_declare(self.intermediate_queue, durable=False)
+            self.channel.queue_declare(self.intermediate_queue, durable=False,
+                                       arguments=get_intermediate_queue_args())
 
         if self.layer_id == 1:
             try:

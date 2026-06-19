@@ -7,6 +7,37 @@ import numpy as np
 import cv2
 
 
+def get_intermediate_queue_args(config=None):
+    """Build the RabbitMQ arguments dict that enforces broker-level overflow
+    protection on intermediate_queue / intermediate_queue_k.
+
+    Returns ``{'x-max-length': N, 'x-overflow': 'reject-publish'}`` so the broker
+    bounds queue depth at N messages and rejects (NACKs) further publishes once
+    full, instead of buffering large frames until it runs out of RAM.
+
+    Every queue_declare for these queues MUST pass the *same* arguments, or
+    RabbitMQ raises PRECONDITION_FAILED and closes the channel. Routing all
+    declares through this helper guarantees that consistency. Returns ``None``
+    (no limit) when max-queue-messages is unset/0, which keeps queue_declare
+    backward compatible with an un-bounded queue.
+
+    Pass ``config`` when it's already loaded (server); otherwise the edge/cloud
+    Scheduler calls it with no args and it reads config.yaml directly.
+    """
+    if config is None:
+        import yaml
+        with open('config.yaml', 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+    rabbit = config.get('rabbit', {}) or {}
+    max_len = rabbit.get('max-queue-messages')
+    if not max_len:
+        return None
+    return {
+        'x-max-length': int(max_len),
+        'x-overflow': rabbit.get('overflow', 'reject-publish'),
+    }
+
+
 def delete_old_queues(address, username, password, virtual_host):
     url = f'http://{address}:15672/api/queues/{quote(virtual_host, safe="")}'
     response = requests.get(url, auth=HTTPBasicAuth(username, password))
@@ -21,7 +52,7 @@ def delete_old_queues(address, username, password, virtual_host):
         for queue in queues:
             queue_name = queue['name']
             if queue_name.startswith("reply") or queue_name.startswith("intermediate_queue") or queue_name.startswith(
-                    "result") or queue_name.startswith("rpc_queue"):
+                    "result") or queue_name.startswith("rpc_queue") or queue_name.startswith("bbox_queue") or queue_name.startswith("mfq"):
 
                 http_channel.queue_delete(queue=queue_name)
 

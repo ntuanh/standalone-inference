@@ -7,6 +7,7 @@ import pika
 import pickle
 import src.Model
 import src.Log
+from src.Utils import get_intermediate_queue_args
 from ultralytics import YOLO
 
 from src.Clustering import (
@@ -65,8 +66,16 @@ class Server:
         # Discard any messages left over from a previous (crashed) run, so
         # depth-based back-pressure starts from an empty queue instead of
         # being thrown off by stale large messages still sitting in RabbitMQ.
-        self.channel.queue_declare(queue='intermediate_queue', durable=False)
+        self.channel.queue_declare(queue='intermediate_queue', durable=False,
+                                   arguments=get_intermediate_queue_args(config))
         self.channel.queue_purge(queue='intermediate_queue')
+
+        # adaptive mode: edge ships locally-computed bboxes here (no cloud YOLO).
+        # Kept separate from intermediate_queue so its depth doesn't pollute the
+        # edge's "is the cloud backed up?" routing signal.
+        self.channel.queue_declare(queue='bbox_queue', durable=False,
+                                   arguments=get_intermediate_queue_args(config))
+        self.channel.queue_purge(queue='bbox_queue')
 
         self.register_clients = [0 for _ in range(len(self.total_clients))]
         self.list_clients = []
@@ -260,7 +269,7 @@ class Server:
             mode = self._get_mode()
             splits = None
 
-            if mode in ["only_edge", "only_cloud"]:
+            if mode in ["only_edge", "only_cloud", "adaptive"]:
                 src.Log.print_with_color(f"[Benchmark] mode={mode}, skip split selection", "yellow")
 
             else:
@@ -303,7 +312,8 @@ class Server:
                         # per-cluster queue, same reasoning as 'intermediate_queue' above.
                         for k in range(K):
                             qname = f"intermediate_queue_{k}"
-                            self.channel.queue_declare(queue=qname, durable=False)
+                            self.channel.queue_declare(queue=qname, durable=False,
+                                                       arguments=get_intermediate_queue_args(self.config))
                             self.channel.queue_purge(queue=qname)
 
                     except Exception as e:

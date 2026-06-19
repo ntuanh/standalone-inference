@@ -85,6 +85,66 @@ class Scheduler:
         except Exception:
             return 0
 
+    # Connection errors that mean "the TCP link to the broker died, rebuild it".
+    # A single-threaded BlockingConnection can't service I/O during multi-second
+    # blocking inference, so the broker / a NAT may drop the idle socket; we
+    # recover by reconnecting rather than trying to prevent the drop.
+    _CONN_ERRORS = (
+        pika.exceptions.StreamLostError,
+        pika.exceptions.AMQPConnectionError,
+        pika.exceptions.ConnectionClosed,
+        pika.exceptions.ChannelWrongStateError,
+        pika.exceptions.ChannelClosed,
+    )
+
+    def _rabbit_params(self):
+        import yaml
+        with open('config.yaml', 'r', encoding='utf-8') as f:
+            cfg = yaml.safe_load(f)
+        r = cfg['rabbit']
+        return pika.ConnectionParameters(
+            host=r['address'], port=5672,
+            virtual_host=f"{r['virtual-host']}",
+            credentials=pika.PlainCredentials(r['username'], r['password']),
+            heartbeat=0, blocked_connection_timeout=600,
+        )
+
+    def _reconnect(self):
+        """Tear down the dead connection and build a fresh one + channel, then
+        restore the queue declarations and publisher confirms so the caller can
+        retry. Retries until the broker is reachable again."""
+        Log.print_with_color("[Reconnect] Connection lost — rebuilding RabbitMQ link...", "yellow")
+        # Best-effort close of the old, broken objects.
+        try:
+            old_conn = self.channel.connection
+        except Exception:
+            old_conn = None
+        for obj in (self.channel, old_conn):
+            try:
+                if obj is not None and obj.is_open:
+                    obj.close()
+            except Exception:
+                pass
+
+        while True:
+            try:
+                connection = pika.BlockingConnection(self._rabbit_params())
+                self.channel = connection.channel()
+                # Re-declare the queues this client touches (idempotent; args must
+                # match the original declares or the broker rejects them).
+                self.channel.queue_declare(self.intermediate_queue, durable=False,
+                                           arguments=get_intermediate_queue_args())
+                self.channel.queue_declare(self.bbox_queue, durable=False,
+                                           arguments=get_bbox_queue_args())
+                if self._confirms_enabled:
+                    self._confirms_enabled = False
+                    self._enable_publisher_confirms()
+                Log.print_with_color("[Reconnect] RabbitMQ link re-established.", "green")
+                return
+            except Exception as e:
+                Log.print_with_color(f"[Reconnect] Retry in 1s ({e})", "yellow")
+                time.sleep(1.0)
+
     def _check_backpressure(self):
         max_queue = MAX_QUEUE_ONLY_CLOUD
         depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
@@ -138,6 +198,10 @@ class Scheduler:
                     self.channel.connection.sleep(0.1)
                 except Exception:
                     time.sleep(0.1)
+            except self._CONN_ERRORS:
+                # Broker reset the idle socket (e.g. during long inference) —
+                # rebuild the connection and retry the same body (no loss).
+                self._reconnect()
 
     def write_metrics(self, mode, role, best_cut, batch_id, batch_size, latency_ms, fps, ram_mb, message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None, inference_path=""):
         file_path = f"metrics_raw_{self.intermediate_queue}_{str(self.client_id).replace('-', '')}.csv"
@@ -590,13 +654,19 @@ class Scheduler:
         with open(self._timing_log_cloud, "w") as _tf:
             print(str(time.time_ns()) + " start", file=_tf)
         while True:
-            method_frame, header_frame, body = self.channel.basic_get(queue=self.intermediate_queue, auto_ack=True)
-            src_queue = "intermediate"
-            # adaptive: if no raw batch to run, drain edge-computed bboxes (metrics only).
-            # intermediate_queue is checked first so cloud YOLO always has priority.
-            if not (method_frame and body) and mode == "adaptive":
-                method_frame, header_frame, body = self.channel.basic_get(queue=self.bbox_queue, auto_ack=True)
-                src_queue = "bbox"
+            try:
+                method_frame, header_frame, body = self.channel.basic_get(queue=self.intermediate_queue, auto_ack=True)
+                src_queue = "intermediate"
+                # adaptive: if no raw batch to run, drain edge-computed bboxes (metrics only).
+                # intermediate_queue is checked first so cloud YOLO always has priority.
+                if not (method_frame and body) and mode == "adaptive":
+                    method_frame, header_frame, body = self.channel.basic_get(queue=self.bbox_queue, auto_ack=True)
+                    src_queue = "bbox"
+            except self._CONN_ERRORS:
+                # Connection dropped (e.g. during the previous long inference) —
+                # reconnect and retry the get on the next loop iteration.
+                self._reconnect()
+                continue
             if method_frame and body:
                 t_batch_ready = time.perf_counter()
                 gap_ms = (t_batch_ready - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
@@ -717,7 +787,11 @@ class Scheduler:
 
             else:
                 broadcast_queue_name = f'reply_{self.client_id}'
-                method_frame, header_frame, body = self.channel.basic_get(queue=broadcast_queue_name, auto_ack=True)
+                try:
+                    method_frame, header_frame, body = self.channel.basic_get(queue=broadcast_queue_name, auto_ack=True)
+                except self._CONN_ERRORS:
+                    self._reconnect()
+                    continue
                 if body:
                     received_data = pickle.loads(body)
                     Log.print_with_color(f"[<<<] Received message from server {received_data}", "blue")

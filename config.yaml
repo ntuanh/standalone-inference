@@ -1,0 +1,50 @@
+name: YOLO
+server:
+  cut-layer: a # or b, c, d
+  clients:
+    - 9 #edge
+    - 3 #cloud
+  model: yolo26n
+  batch-size: 32
+experiment:
+  enable: True   #False
+  # adaptive: per-batch routing — intermediate_queue empty → full cloud YOLO
+  #           (path 'split'); else → full edge YOLO, bboxes via bbox_queue
+  #           (path 'edge_only'). No model split.
+  mode: adaptive
+  #mode: only_cloud
+  #mode: only_edge
+rabbit:
+  # address: localhost
+  # username: guest
+  # password: guest
+  address: 192.168.101.91
+  username: "machine-1"
+  password: "123456"
+  virtual-host: /
+  # Broker-level overflow protection on intermediate_queue (and per-cluster
+  # intermediate_queue_k). When the queue depth reaches max-queue-messages the
+  # broker rejects further publishes (x-overflow: reject-publish) and NACKs the
+  # edge publisher; the edge then waits for the cloud to drain and retries, so
+  # no frame is lost and broker RAM stays bounded (~max-queue-messages * msg).
+  # Set to 0 / remove to disable. Keep >= the client-side cap (MAX_QUEUE_ONLY_CLOUD).
+  max-queue-messages: 15
+  overflow: reject-publish
+
+debug-mode: False
+data: video.mp4
+log-path: .
+compress:
+  enable: True
+  num_bit: 8
+
+clustering:
+  enable: False         # True → Hungarian tự chọn cut point; False → dùng cut-layer cố định
+  num_A: 3              # num_A + num_B + num_C = clients[0] (tổng edge)
+  num_B: 3
+  num_C: 3
+  num_cloud: 3         # = clients[1] (tổng cloud)
+  max_clusters: 3      # <= min(clients[0], clients[1])
+  network_rate_mb_s: 100.0
+  measure_bandwidth: True # True → đo thực tế mỗi lần chạy; False → dùng network_rate_mb_s cố định
+  profile_source: real     # auto → dùng real nếu có, không thì simulated; real → ép dùng real; simulated → ép dùng giả lập

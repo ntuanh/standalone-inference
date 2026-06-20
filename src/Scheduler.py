@@ -554,7 +554,10 @@ class Scheduler:
                 with open(self._timing_log_edge, "a") as _tf:
                     print(str(time.time_ns()) + " output", file=_tf)
                 latency_ms = (batch_end - batch_start) * 1000
-                fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
+                # FPS = frames / time spent actually processing this batch (not the
+                # gap since the last batch), so idle/capture waits don't distort it.
+                _proc_s = batch_end - batch_start
+                fps = batch_size / _proc_s if _proc_s > 0 else 0.0
                 e2e_latency_ms = 0.0
                 _ram_start = time.perf_counter()
                 ram_mb = self.get_ram_mb()
@@ -748,7 +751,14 @@ class Scheduler:
                     print(str(time.time_ns()) + " output", file=_tf)
                 cloud_end_wall = time.time()
                 latency_ms = (batch_end - batch_start) * 1000
-                fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
+                # FPS from processing time only. For edge_only batches the cloud did
+                # no inference (just logged a bbox) → fps is meaningless, leave it 0
+                # so it can't inflate the cloud average; the edge row holds the real fps.
+                _proc_s = batch_end - batch_start
+                if cloud_path == "edge_only":
+                    fps = 0.0
+                else:
+                    fps = batch_size / _proc_s if _proc_s > 0 else 0.0
                 e2e_latency_ms = (cloud_end_wall - edge_start_time) * 1000
                 _ram_start = time.perf_counter()
                 ram_mb = self.get_ram_mb()
@@ -940,17 +950,48 @@ class Scheduler:
             vals = [float(r[key]) for r in filtered if r.get(key)]
             return round(sum(vals) / len(vals), 3) if vals else None
 
-        def total_fps(rows):
-            # Với mỗi device: tính trung bình FPS qua các batch (bỏ batch fps=0)
-            # Tổng hệ thống = cộng trung bình FPS của từng device
-            by_device = {}
+        def wallclock_throughput(rows):
+            # True system throughput = total frames handled / wall-clock span of the
+            # run. Unfakeable: averaging per-batch instantaneous fps inflates wildly
+            # when some batches are metrics-only (tiny processing time). Each final
+            # row = one batch; cloud_end_wall = edge_start_time + e2e_latency_ms.
+            starts, ends, frames = [], [], 0
             for r in rows:
+                st = r.get("edge_start_time")
+                bs = r.get("batch_size")
+                if not st or not bs:
+                    continue
+                st = float(st)
+                starts.append(st)
+                frames += int(float(bs))
+                e2e = r.get("e2e_latency_ms")
+                ends.append(st + float(e2e) / 1000.0 if e2e else st)
+            if not starts or not ends:
+                return None
+            span = max(ends) - min(starts)
+            return round(frames / span, 3) if span > 0 else None
+
+        def fps_avg_inferring(rows, exclude_path):
+            # Average per-batch fps over only the rows where this tier actually ran
+            # inference (drop the path the tier didn't compute). Non-adaptive modes
+            # have inference_path="" so nothing is excluded — behaviour unchanged.
+            sel = [r for r in rows if (r.get("inference_path") or "") != exclude_path]
+            return avg(sel, "fps", True)
+
+        def per_device_inference_fps(rows, exclude_path):
+            # {device_seq: mean inference FPS} over ONLY that device's real inference
+            # batches. exclude_path drops the metrics-only path for that tier:
+            #   cloud → drop 'edge_only' (bbox_queue: no YOLO, metrics only)
+            #   edge  → drop 'split'     (intermediate_queue: edge only sent frames)
+            by_dev = {}
+            for r in rows:
+                if (r.get("inference_path") or "") == exclude_path:
+                    continue
                 seq = r.get("device_seq")
-                val = float(r.get("fps") or 0)
-                if val > 0 and seq is not None:
-                    by_device.setdefault(seq, []).append(val)
-            device_avgs = [sum(v) / len(v) for v in by_device.values() if v]
-            return round(sum(device_avgs), 3) if device_avgs else None
+                f = float(r.get("fps") or 0)
+                if seq is not None and f > 0:
+                    by_dev.setdefault(seq, []).append(f)
+            return {seq: round(sum(v) / len(v), 3) for seq, v in sorted(by_dev.items()) if v}
 
         def mb(val):
             return round(val / 1024 / 1024, 3) if val is not None else "N/A"
@@ -959,8 +1000,8 @@ class Scheduler:
         cut_str = "/".join(sorted(str(c) for c in cuts))
         all_rows = cloud_rows if cloud_rows else edge_rows
         final_rows = cloud_rows if cloud_rows else edge_rows
-        system_fps = total_fps(final_rows)
-        valid_batches = len([r for r in final_rows if float(r.get("fps") or 0) > 0])
+        system_fps = wallclock_throughput(final_rows)
+        valid_batches = len([r for r in final_rows if r.get("edge_start_time")])
         # Edge metrics chỉ tính trên batch có cloud match (batch kia tính ở cloud kia)
         # Fallback về tất cả edge_rows nếu không có cloud (only_edge mode)
         matched_edge_rows = [e for e, c in matched_pairs if c and e]
@@ -968,10 +1009,18 @@ class Scheduler:
         print("=" * 50)
         print(f"  SUMMARY  |  batches={n_rows} (valid={valid_batches})  cut={cut_str}")
         print("=" * 50)
-        print(f"  [EDGE]  latency={avg(summary_edge_rows,'latency_ms',True)} ms  fps={avg(summary_edge_rows,'fps',True)}  ram={avg(summary_edge_rows,'ram_mb',True)} MB  msg={mb(avg(summary_edge_rows,'message_size_bytes'))} MB")
-        print(f"  [CLOUD] latency={avg(cloud_rows,'latency_ms',True)} ms  fps={avg(cloud_rows,'fps',True)}  ram={avg(cloud_rows,'ram_mb',True)} MB  msg={mb(avg(cloud_rows,'message_size_bytes'))} MB")
+        print(f"  [EDGE]  latency={avg(summary_edge_rows,'latency_ms',True)} ms  fps={fps_avg_inferring(summary_edge_rows,'split')}  ram={avg(summary_edge_rows,'ram_mb',True)} MB  msg={mb(avg(summary_edge_rows,'message_size_bytes'))} MB")
+        print(f"  [CLOUD] latency={avg(cloud_rows,'latency_ms',True)} ms  fps={fps_avg_inferring(cloud_rows,'edge_only')}  ram={avg(cloud_rows,'ram_mb',True)} MB  msg={mb(avg(cloud_rows,'message_size_bytes'))} MB")
         print(f"  [E2E]   latency={avg(all_rows,'e2e_latency_ms',True)} ms")
-        print(f"  [SYSTEM TOTAL FPS] {system_fps} fps  (sum of avg fps across {len(set(r.get('device_seq') for r in final_rows))} final device(s))")
+        # Per-device inference FPS (intermediate_queue = cloud YOLO; bbox_queue
+        # edge_only batches are metrics-only and excluded).
+        edge_dev_fps  = per_device_inference_fps(edge_rows,  "split")
+        cloud_dev_fps = per_device_inference_fps(cloud_rows, "edge_only")
+        for seq, f in edge_dev_fps.items():
+            print(f"  [EDGE  dev {seq}] inference fps={f}")
+        for seq, f in cloud_dev_fps.items():
+            print(f"  [CLOUD dev {seq}] inference fps={f}  (intermediate_queue batches only)")
+        print(f"  [SYSTEM THROUGHPUT] {system_fps} fps  ({valid_batches} batches handled / wall-clock span)")
         print("=" * 50)
         Log.print_with_color(f"Saved {out_path} ({n_rows} batches)", "green")
         n_edge_devices = len(set(r.get("device_seq") for r in edge_rows))

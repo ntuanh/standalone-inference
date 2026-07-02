@@ -49,6 +49,11 @@ class Scheduler:
         self.bbox_queue = "bbox_queue"
         self.channel.queue_declare(self.bbox_queue, durable=False,
                                    arguments=get_bbox_queue_args())
+        # FPS ping channel: the cloud publishes one tiny "done" message here per
+        # finished batch; the SERVER consumes them and computes FPS centrally
+        # (see Server.on_fps_done). Unbounded — pings are a few hundred bytes.
+        self.fps_queue = "fps_queue"
+        self.channel.queue_declare(self.fps_queue, durable=False)
         self._my_metrics_queue = None  # set by _setup_metrics_fanout_queue
         # Publisher confirms (enabled lazily on the edge in first_layer) let the
         # broker NACK a publish that hit the reject-publish overflow ceiling, so
@@ -136,6 +141,7 @@ class Scheduler:
                                            arguments=get_intermediate_queue_args())
                 self.channel.queue_declare(self.bbox_queue, durable=False,
                                            arguments=get_bbox_queue_args())
+                self.channel.queue_declare(self.fps_queue, durable=False)
                 if self._confirms_enabled:
                     self._confirms_enabled = False
                     self._enable_publisher_confirms()
@@ -589,6 +595,18 @@ class Scheduler:
                 )
                 write_ms = (time.perf_counter() - _write_start) * 1000
 
+                # Bare "DONE" ping → fps_queue when the EDGE is the tier that
+                # completed this batch (only_edge, or adaptive routed edge_only).
+                # In split/only_cloud the cloud finishes the batch and pings
+                # instead — exactly one ping per batch system-wide. The server
+                # computes system FPS as batch_size / delta between DONEs.
+                if mode == "only_edge" or route_path == "edge_only":
+                    try:
+                        self.channel.basic_publish(
+                            exchange='', routing_key=self.fps_queue, body=b"DONE")
+                    except Exception as e:
+                        Log.print_with_color(f"[FPS] ping publish failed: {e}", "yellow")
+
                 batch_interval_ms = (batch_end - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
                 Log.print_with_color(
                     f"[Timing][edge] gap={gap_ms:.1f}ms stack={stack_ms:.1f}ms "
@@ -780,6 +798,18 @@ class Scheduler:
                     inference_path=cloud_path,
                 )
                 write_ms = (time.perf_counter() - _write_start) * 1000
+
+                # Bare "DONE" ping → fps_queue when the CLOUD is the tier that
+                # completed this batch (split / only_cloud / adaptive split-path).
+                # only_edge results and adaptive bbox messages are skipped — the
+                # edge already pinged those batches, keeping the system at
+                # exactly one ping per batch so the server's 1/delta FPS holds.
+                if eff != "only_edge":
+                    try:
+                        self.channel.basic_publish(
+                            exchange='', routing_key=self.fps_queue, body=b"DONE")
+                    except Exception as e:
+                        Log.print_with_color(f"[FPS] ping publish failed: {e}", "yellow")
 
                 batch_interval_ms = (batch_end - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
                 Log.print_with_color(

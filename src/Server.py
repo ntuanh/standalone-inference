@@ -3,6 +3,7 @@ import os
 import sys
 import glob
 import base64
+import time
 import pika
 import pickle
 import src.Model
@@ -78,6 +79,11 @@ class Server:
                                    arguments=get_bbox_queue_args(config))
         self.channel.queue_purge(queue='bbox_queue')
 
+        # fps_queue: every cloud publishes one tiny "done" ping per completed
+        # batch; the server consumes them (on_fps_done) and computes FPS live.
+        self.channel.queue_declare(queue='fps_queue', durable=False)
+        self.channel.queue_purge(queue='fps_queue')
+
         self.register_clients = [0 for _ in range(len(self.total_clients))]
         self.list_clients = []
         self.registered_ids = set()
@@ -91,6 +97,21 @@ class Server:
         self.channel.basic_qos(prefetch_count=1)
         self.reply_channel = self.connection.channel()
         self.channel.basic_consume(queue='rpc_queue', on_message_callback=self.on_request)
+
+        # FPS tracking state, fed by bare "DONE" pings on fps_queue — one per
+        # batch, sent by whichever tier (edge or cloud) completed it. System
+        # FPS = batch_size / delta between consecutive DONEs, measured on the
+        # server's own clock so clock skew between devices cannot distort it.
+        # batch_size comes from config (constant for the whole run).
+        self._fps_first_ts = None     # arrival of the first DONE
+        self._fps_prev_ts = None      # arrival of the previous DONE
+        self._fps_total_batches = 0
+        self._fps_list = []           # per-DONE fps (batch_size/delta); summary = mean
+        # Queues that hold not-yet-processed batches. The post-STOP drain loop
+        # keeps collecting DONEs while any of these are non-empty, so the server
+        # cannot shut down before the clouds finish the backlog.
+        self._work_queues = ["intermediate_queue", "bbox_queue"]
+        self.channel.basic_consume(queue='fps_queue', on_message_callback=self.on_fps_done)
 
         self.data = config["data"]
         self.compress = config["compress"]
@@ -174,8 +195,93 @@ class Server:
         src.Log.print_with_color(f"[>>>] Sent notification to client {client_id}", "red")
         self.reply_channel.basic_publish(exchange='', routing_key=reply_queue_name, body=message)
 
+    def _handle_fps_done(self):
+        """One batch (batch_size frames) fully handled somewhere in the system —
+        whichever tier (edge or cloud) completed it published a bare "DONE".
+        System FPS = batch_size / delta between two consecutive DONEs, on the
+        server's own clock. DONEs from all edges and clouds interleave into one
+        stream, so more devices finishing work naturally shrinks delta and
+        raises the measured FPS. The first DONE only starts the clock."""
+        now = time.time()
+        self._fps_total_batches += 1
+
+        if self._fps_prev_ts is None:
+            self._fps_first_ts = now
+            self._fps_prev_ts = now
+            src.Log.print_with_color("[FPS] #1 DONE — timing started", "cyan")
+            return
+
+        delta = now - self._fps_prev_ts
+        self._fps_prev_ts = now
+
+        system_fps = self.batch_size / delta if delta > 0 else 0.0
+        self._fps_list.append(system_fps)
+        mean_fps = sum(self._fps_list) / len(self._fps_list)
+
+        src.Log.print_with_color(
+            f"[FPS] #{self._fps_total_batches} DONE delta={delta:.3f}s -> "
+            f"system_fps={system_fps:.2f} | mean_fps={mean_fps:.2f}", "cyan")
+
+    def on_fps_done(self, ch, method, _, body):
+        self._handle_fps_done()
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+
+    def _queue_depth(self, qname):
+        """Ready-message count via passive declare. Only call on queues this
+        server itself declared — a passive declare on a missing queue closes
+        the channel (404)."""
+        try:
+            return self.channel.queue_declare(queue=qname, passive=True).method.message_count
+        except Exception:
+            return 0
+
+    def _drain_fps_pings(self, idle_grace_s=10.0):
+        """The STOP broadcast fires when all EDGES notify — the clouds are
+        usually still chewing through the backlog at that point, so the server
+        must NOT shut down yet or it loses their remaining DONEs. Keep
+        collecting until (a) every work queue is empty AND (b) no DONE arrived
+        for idle_grace_s. The grace period covers the final batches: a batch
+        being processed right now is already off the queue (auto_ack), so it is
+        invisible to the depth check until its DONE lands."""
+        last_msg = time.time()
+        while True:
+            try:
+                method_frame, _, body = self.channel.basic_get(queue='fps_queue', auto_ack=True)
+            except Exception:
+                return
+            if method_frame:
+                self._handle_fps_done()
+                last_msg = time.time()
+                continue
+            backlog = sum(self._queue_depth(q) for q in self._work_queues)
+            if backlog > 0:
+                last_msg = time.time()  # clouds still have queued work — keep waiting
+            elif time.time() - last_msg >= idle_grace_s:
+                return
+            time.sleep(0.2)
+
+    def _print_fps_summary(self):
+        if not self._fps_list:
+            src.Log.print_with_color(
+                "[FPS] Fewer than 2 'DONE' pings received — cannot compute FPS.", "yellow")
+            return
+        mean_fps = sum(self._fps_list) / len(self._fps_list)
+        span = (self._fps_prev_ts - self._fps_first_ts) if self._fps_first_ts else 0.0
+        throughput = (self._fps_total_batches - 1) * self.batch_size / span if span > 0 else 0.0
+        frames = self._fps_total_batches * self.batch_size
+        print("=" * 50)
+        print(f"  [FPS SUMMARY]  batches={self._fps_total_batches}  frames={frames}  span={span:.2f}s")
+        print(f"  MEAN FPS = {mean_fps:.3f}   (mean of {len(self._fps_list)} per-DONE fps values)")
+        print(f"  wall-clock throughput = {throughput:.3f} fps")
+        print("=" * 50)
+
     def start(self):
         self.channel.start_consuming()
+        # STOP has been broadcast, but clouds may still be finishing their
+        # backlog — keep collecting fps pings until the queue goes quiet,
+        # then print the final system FPS.
+        self._drain_fps_pings()
+        self._print_fps_summary()
         self.connection.close()
         sys.exit(0)
 
@@ -316,6 +422,9 @@ class Server:
                             self.channel.queue_declare(queue=qname, durable=False,
                                                        arguments=get_intermediate_queue_args(self.config))
                             self.channel.queue_purge(queue=qname)
+                            # watched by the post-STOP FPS drain loop
+                            if qname not in self._work_queues:
+                                self._work_queues.append(qname)
 
                     except Exception as e:
                         raise RuntimeError(f"Hungarian clustering failed: {e}")

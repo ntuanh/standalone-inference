@@ -99,14 +99,14 @@ class Server:
         self.channel.basic_consume(queue='rpc_queue', on_message_callback=self.on_request)
 
         # FPS tracking state, fed by bare "DONE" pings on fps_queue — one per
-        # batch, sent by whichever tier (edge or cloud) completed it. System
-        # FPS = batch_size / delta between consecutive DONEs, measured on the
-        # server's own clock so clock skew between devices cannot distort it.
-        # batch_size comes from config (constant for the whole run).
-        self._fps_first_ts = None     # arrival of the first DONE
-        self._fps_prev_ts = None      # arrival of the previous DONE
-        self._fps_total_batches = 0
-        self._fps_list = []           # per-DONE fps (batch_size/delta); summary = mean
+        # batch, sent by whichever tier (edge or cloud) completed it. Every
+        # arrival timestamp is recorded (server's own clock, so device clock
+        # skew cannot distort it) and all FPS numbers derive from that list.
+        # Exact system FPS = frames / wall-clock time. The arithmetic mean of
+        # instantaneous 1/delta values is NOT used: bursty arrivals (tiny
+        # deltas → huge fps entries) inflate it far above the real rate.
+        self._done_times = []         # arrival time of every DONE
+        self._run_start_ts = None     # when START was broadcast to clients
         # Queues that hold not-yet-processed batches. The post-STOP drain loop
         # keeps collecting DONEs while any of these are non-empty, so the server
         # cannot shut down before the clouds finish the backlog.
@@ -198,29 +198,32 @@ class Server:
     def _handle_fps_done(self):
         """One batch (batch_size frames) fully handled somewhere in the system —
         whichever tier (edge or cloud) completed it published a bare "DONE".
-        System FPS = batch_size / delta between two consecutive DONEs, on the
-        server's own clock. DONEs from all edges and clouds interleave into one
-        stream, so more devices finishing work naturally shrinks delta and
-        raises the measured FPS. The first DONE only starts the clock."""
+        Record the arrival time and report three views of FPS:
+          inst    = batch_size / delta since the previous DONE (noisy, bursty)
+          window  = frames / time over the last <=16 DONEs (smoothed live view)
+          system  = frames / time since the first DONE (exact cumulative rate)
+        Only 'system' (and TOTAL TIME in the summary) is exact; inst/window
+        are for watching the run live."""
         now = time.time()
-        self._fps_total_batches += 1
-
-        if self._fps_prev_ts is None:
-            self._fps_first_ts = now
-            self._fps_prev_ts = now
+        self._done_times.append(now)
+        n = len(self._done_times)
+        if n == 1:
             src.Log.print_with_color("[FPS] #1 DONE — timing started", "cyan")
             return
 
-        delta = now - self._fps_prev_ts
-        self._fps_prev_ts = now
+        delta = now - self._done_times[-2]
+        inst_fps = self.batch_size / delta if delta > 0 else 0.0
 
-        system_fps = self.batch_size / delta if delta > 0 else 0.0
-        self._fps_list.append(system_fps)
-        mean_fps = sum(self._fps_list) / len(self._fps_list)
+        w = self._done_times[-16:]
+        win_span = w[-1] - w[0]
+        win_fps = (len(w) - 1) * self.batch_size / win_span if win_span > 0 else 0.0
+
+        span = now - self._done_times[0]
+        system_fps = (n - 1) * self.batch_size / span if span > 0 else 0.0
 
         src.Log.print_with_color(
-            f"[FPS] #{self._fps_total_batches} DONE delta={delta:.3f}s -> "
-            f"system_fps={system_fps:.2f} | mean_fps={mean_fps:.2f}", "cyan")
+            f"[FPS] #{n} DONE delta={delta:.3f}s inst={inst_fps:.2f} "
+            f"| window_fps={win_fps:.2f} | system_fps={system_fps:.2f}", "cyan")
 
     def on_fps_done(self, ch, method, _, body):
         self._handle_fps_done()
@@ -261,19 +264,34 @@ class Server:
             time.sleep(0.2)
 
     def _print_fps_summary(self):
-        if not self._fps_list:
+        """Exact system FPS = frames / wall-clock time. Two anchors are shown:
+        START→last DONE (whole run incl. warm-up: model load + first batch) and
+        first→last DONE (steady state). The arithmetic mean of per-DONE 1/delta
+        values is printed only as a reference — bursty arrivals make it read
+        far above the rate the system actually sustained."""
+        n = len(self._done_times)
+        if n < 2:
             src.Log.print_with_color(
                 "[FPS] Fewer than 2 'DONE' pings received — cannot compute FPS.", "yellow")
             return
-        mean_fps = sum(self._fps_list) / len(self._fps_list)
-        span = (self._fps_prev_ts - self._fps_first_ts) if self._fps_first_ts else 0.0
-        throughput = (self._fps_total_batches - 1) * self.batch_size / span if span > 0 else 0.0
-        frames = self._fps_total_batches * self.batch_size
-        print("=" * 50)
-        print(f"  [FPS SUMMARY]  batches={self._fps_total_batches}  frames={frames}  span={span:.2f}s")
-        print(f"  MEAN FPS = {mean_fps:.3f}   (mean of {len(self._fps_list)} per-DONE fps values)")
-        print(f"  wall-clock throughput = {throughput:.3f} fps")
-        print("=" * 50)
+        t_first, t_last = self._done_times[0], self._done_times[-1]
+        frames = n * self.batch_size
+        span = t_last - t_first
+        steady_fps = (n - 1) * self.batch_size / span if span > 0 else 0.0
+        deltas = [b - a for a, b in zip(self._done_times, self._done_times[1:])]
+        inst = [self.batch_size / d for d in deltas if d > 0]
+        arith_mean = sum(inst) / len(inst) if inst else 0.0
+
+        print("=" * 60)
+        print(f"  [FPS SUMMARY]  batches={n}  frames={frames}")
+        if self._run_start_ts is not None:
+            total = t_last - self._run_start_ts
+            total_fps = frames / total if total > 0 else 0.0
+            print(f"  TOTAL TIME (START -> last DONE) = {total:.2f}s")
+            print(f"  SYSTEM FPS (frames/total time)  = {total_fps:.3f}")
+        print(f"  first->last DONE span = {span:.2f}s  -> steady-state FPS = {steady_fps:.3f}")
+        print(f"  (mean of per-DONE 1/delta fps = {arith_mean:.3f} — inflated by bursts, reference only)")
+        print("=" * 60)
 
     def start(self):
         self.channel.start_consuming()
@@ -473,6 +491,10 @@ class Server:
                     "mode":       self._get_mode(),
                 }
                 self.send_to_response(client_id, pickle.dumps(response))
+
+            # Inference effectively starts now — anchor for TOTAL TIME and the
+            # exact SYSTEM FPS (frames / total time) in the final summary.
+            self._run_start_ts = time.time()
         else:
             response = {"action": "STOP", "message": "Stop inference !!!"}
             for (client_id, layer_id) in self.list_clients:

@@ -309,6 +309,57 @@ fps = batch_size / (batch_end - prev_batch_end)
 
 The **total system FPS** is the sum of the per-device average FPS across all final devices (cloud devices in split/only-cloud mode, edge devices in only-edge mode), since all final devices process frames in parallel. The first-batch **0.0** values are excluded from the per-device average so they do not distort the result.
 
+> For the authoritative system-wide number, see [System FPS (fps_queue)](#system-fps-fps_queue) below — it is measured live on a single clock at the server, so it cannot be distorted by clock skew or per-device averaging.
+
+---
+
+## System FPS (fps_queue)
+
+The server measures **real system throughput** centrally, while the run is going, using a dedicated `fps_queue`:
+
+```
+edge/cloud finishes a batch  →  publishes "DONE"  →  server records arrival time
+
+SYSTEM FPS = total frames / total time
+           = (number of DONEs × batch_size) / (last DONE − START broadcast)
+```
+
+**Who sends the "DONE"** — only the device that *completes* a batch, so one DONE always equals exactly `batch_size` frames and nothing is counted twice:
+
+| Mode | Sender |
+|---|---|
+| `split`, `only_cloud` | cloud |
+| `only_edge` | edge |
+| `adaptive` | edge for `edge_only` batches, cloud for `split` batches |
+
+**Why arrival counting instead of averaging rates** — the message body carries no data; the server timestamps each arrival with **its own clock**, so clock differences between devices cannot distort the measurement. Averaging per-batch instantaneous FPS (`batch_size / delta`) is deliberately avoided: DONEs arrive in bursts, and the burst intervals produce huge FPS entries that inflate an arithmetic mean far above the rate the system actually sustains (e.g. a run measured 26.6 fps true throughput while the mean of instantaneous values read 102).
+
+**Live output** — the server prints one line per DONE:
+
+```
+[FPS] #42 DONE delta=0.512s inst=62.50 | window_fps=64.10 | system_fps=63.87
+```
+
+- `inst` — `batch_size / delta` since the previous DONE (noisy, for spotting stalls)
+- `window_fps` — frames over the last ≤16 DONEs (smoothed live view)
+- `system_fps` — cumulative frames / elapsed time (converges to the true rate)
+
+**Final summary** — printed when the run ends:
+
+```
+============================================================
+  [FPS SUMMARY]  batches=252  frames=8064
+  TOTAL TIME (START -> last DONE) = 315.40s
+  SYSTEM FPS (frames/total time)  = 25.568
+  first->last DONE span = 301.73s  -> steady-state FPS = 26.620
+============================================================
+```
+
+- **SYSTEM FPS** — whole run including warm-up (model load, first batch in flight)
+- **steady-state FPS** — excludes warm-up; use this when comparing modes or cut points
+
+**Shutdown safety** — the STOP protocol fires when all edges finish *sending*, but clouds are usually still draining queued batches at that point. The server does not exit then: it keeps collecting DONEs while `intermediate_queue` / `bbox_queue` (and any per-cluster queues) are non-empty, plus a 10 s grace period for the final in-flight batch, so backlog processed after the edges finish is still counted in the summary.
+
 ---
 
 ## RAM

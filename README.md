@@ -332,7 +332,7 @@ SYSTEM FPS = total frames / total time
 | `only_edge` | edge |
 | `adaptive` | edge for `edge_only` batches, cloud for `split` batches |
 
-**Why arrival counting instead of averaging rates** — the message body carries no data; the server timestamps each arrival with **its own clock**, so clock differences between devices cannot distort the measurement. Averaging per-batch instantaneous FPS (`batch_size / delta`) is deliberately avoided: DONEs arrive in bursts, and the burst intervals produce huge FPS entries that inflate an arithmetic mean far above the rate the system actually sustains (e.g. a run measured 26.6 fps true throughput while the mean of instantaneous values read 102).
+**Why arrival counting instead of averaging rates** — the message body carries no data; the server timestamps each arrival with **its own clock**, so clock differences between devices cannot distort the measurement. Averaging per-batch instantaneous FPS (`batch_size / delta`) is deliberately avoided: DONEs arrive in bursts, and the burst intervals produce huge FPS entries that inflate an arithmetic mean far above the rate the system actually sustains (e.g. a run measured 28.3 fps true throughput while the mean of instantaneous values read 133.7).
 
 **Live output** — the server prints one line per DONE:
 
@@ -349,14 +349,16 @@ SYSTEM FPS = total frames / total time
 ```
 ============================================================
   [FPS SUMMARY]  batches=252  frames=8064
-  TOTAL TIME (START -> last DONE) = 315.40s
-  SYSTEM FPS (frames/total time)  = 25.568
-  first->last DONE span = 301.73s  -> steady-state FPS = 26.620
+  TOTAL TIME (START -> last DONE) = 284.64s
+  SYSTEM FPS (frames/total time)  = 28.331
+  first->last DONE span = 277.93s  -> steady-state FPS = 28.899
+  (mean of per-DONE 1/delta fps = 133.709 — inflated by bursts, reference only)
 ============================================================
 ```
 
 - **SYSTEM FPS** — whole run including warm-up (model load, first batch in flight)
 - **steady-state FPS** — excludes warm-up; use this when comparing modes or cut points
+- **mean of per-DONE 1/delta fps** — arithmetic mean of the instantaneous per-DONE rates; DONEs arrive in bursts so this reads far above real throughput (133.7 vs 28.3 here). Printed for reference only — never use it as the system FPS.
 
 **Shutdown safety** — the STOP protocol fires when all edges finish *sending*, but clouds are usually still draining queued batches at that point. The server does not exit then: it keeps collecting DONEs while `intermediate_queue` / `bbox_queue` (and any per-cluster queues) are non-empty, plus a 10 s grace period for the final in-flight batch, so backlog processed after the edges finish is still counted in the summary.
 

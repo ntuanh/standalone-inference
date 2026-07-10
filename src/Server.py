@@ -105,8 +105,14 @@ class Server:
         # Exact system FPS = frames / wall-clock time. The arithmetic mean of
         # instantaneous 1/delta values is NOT used: bursty arrivals (tiny
         # deltas → huge fps entries) inflate it far above the real rate.
-        self._done_times = []         # arrival time of every DONE
-        self._run_start_ts = None     # when START was broadcast to clients
+        self._fps_times = []          # arrival time (s) of every DONE
+        self._fps_start_t = None      # when START was broadcast to clients
+        self._fps_window = 16         # DONEs per live smoothed sample
+        self._fps_printed = False
+        self._fps_stop_bcast_t = None # when the first tier finished (STOP broadcast)
+        fps_cfg = config.get("fps") or {}
+        self._fps_grace_s = float(fps_cfg.get("grace_s", 10.0))
+        self._fps_hardcap_s = float(fps_cfg.get("shutdown_timeout_s", 300.0))
         # Queues that hold not-yet-processed batches. The post-STOP drain loop
         # keeps collecting DONEs while any of these are non-empty, so the server
         # cannot shut down before the clouds finish the backlog.
@@ -117,6 +123,11 @@ class Server:
         self.compress = config["compress"]
 
         log_path = config["log-path"]
+        # Per-batch ns-epoch log: one line per DONE, "<ns> [<window_fps>]".
+        # Truncated at every server start so a new run never mixes with the
+        # previous one.
+        self.batch_log_path = f"{log_path}/batch_done_ns.log"
+        open(self.batch_log_path, "w").close()
         self.logger = src.Log.Logger(f"{log_path}/app.log", config["debug-mode"])
         self.logger.log_info(f"Application start. Server is waiting for {self.total_clients} clients.")
         src.Log.print_with_color(f"Application start. Server is waiting for {self.total_clients} clients.", "green")
@@ -182,6 +193,7 @@ class Server:
             if self.count_clients == self.total_clients[0]:
                 self.logger.log_info("Stop Inference !!!")
                 self._stopping = True
+                self._fps_stop_bcast_t = time.time()  # hard-cap anchor for the drain
                 self.notify_clients(start=False)
                 ch.basic_ack(delivery_tag=method.delivery_tag)
                 self.channel.stop_consuming()
@@ -195,38 +207,33 @@ class Server:
         src.Log.print_with_color(f"[>>>] Sent notification to client {client_id}", "red")
         self.reply_channel.basic_publish(exchange='', routing_key=reply_queue_name, body=message)
 
-    def _handle_fps_done(self):
+    def _record_fps_done(self):
         """One batch (batch_size frames) fully handled somewhere in the system —
         whichever tier (edge or cloud) completed it published a bare "DONE".
-        Record the arrival time and report three views of FPS:
-          inst    = batch_size / delta since the previous DONE (noisy, bursty)
-          window  = frames / time over the last <=16 DONEs (smoothed live view)
-          system  = frames / time since the first DONE (exact cumulative rate)
-        Only 'system' (and TOTAL TIME in the summary) is exact; inst/window
-        are for watching the run live."""
-        now = time.time()
-        self._done_times.append(now)
-        n = len(self._done_times)
-        if n == 1:
-            src.Log.print_with_color("[FPS] #1 DONE — timing started", "cyan")
-            return
-
-        delta = now - self._done_times[-2]
-        inst_fps = self.batch_size / delta if delta > 0 else 0.0
-
-        w = self._done_times[-16:]
-        win_span = w[-1] - w[0]
-        win_fps = (len(w) - 1) * self.batch_size / win_span if win_span > 0 else 0.0
-
-        span = now - self._done_times[0]
-        system_fps = (n - 1) * self.batch_size / span if span > 0 else 0.0
-
-        src.Log.print_with_color(
-            f"[FPS] #{n} DONE delta={delta:.3f}s inst={inst_fps:.2f} "
-            f"| window_fps={win_fps:.2f} | system_fps={system_fps:.2f}", "cyan")
+        Take ONE clock reading and derive both the FPS math and the ns log line
+        from it, so the logged timestamp is exactly the arrival the math used.
+        The live smoothed view only starts once a full window of arrivals
+        exists; the first W-1 batches log the bare timestamp."""
+        t_ns = time.time_ns()
+        self._fps_times.append(t_ns / 1e9)
+        n = len(self._fps_times)
+        W = self._fps_window
+        window_fps = None
+        if n >= W:
+            span = self._fps_times[-1] - self._fps_times[-W]
+            if span > 0:
+                window_fps = (W - 1) * self.batch_size / span
+                src.Log.print_with_color(
+                    f"[FPS] DONE #{n}  window_fps={window_fps:6.2f} (last {W} batches)", "cyan")
+        with open(self.batch_log_path, "a") as f:
+            if window_fps is None:
+                f.write(f"{t_ns}\n")
+            else:
+                f.write(f"{t_ns} {window_fps:.2f}\n")
 
     def on_fps_done(self, ch, method, _, body):
-        self._handle_fps_done()
+        # body (b"DONE") is intentionally ignored — the arrival is the event.
+        self._record_fps_done()
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
     def _queue_depth(self, qname):
@@ -238,68 +245,75 @@ class Server:
         except Exception:
             return 0
 
-    def _drain_fps_pings(self, idle_grace_s=10.0):
+    def _drain_fps_pings(self):
         """The STOP broadcast fires when all EDGES notify — the clouds are
         usually still chewing through the backlog at that point, so the server
         must NOT shut down yet or it loses their remaining DONEs. Keep
         collecting until (a) every work queue is empty AND (b) no DONE arrived
-        for idle_grace_s. The grace period covers the final batches: a batch
-        being processed right now is already off the queue (auto_ack), so it is
-        invisible to the depth check until its DONE lands."""
+        for grace_s. The grace period covers the final batches: a batch being
+        processed right now is already off the queue (auto_ack), so it is
+        invisible to the depth check until its DONE lands. A hard cap bounds
+        the wait so a worker dying mid-drain can't hang the server forever.
+        Returns the stop reason for the final summary."""
         last_msg = time.time()
         while True:
+            if self._fps_stop_bcast_t is not None and \
+                    time.time() - self._fps_stop_bcast_t >= self._fps_hardcap_s:
+                return "hard cap reached"
             try:
                 method_frame, _, body = self.channel.basic_get(queue='fps_queue', auto_ack=True)
             except Exception:
-                return
+                return "fps_queue unreachable"
             if method_frame:
-                self._handle_fps_done()
+                self._record_fps_done()
                 last_msg = time.time()
                 continue
             backlog = sum(self._queue_depth(q) for q in self._work_queues)
             if backlog > 0:
                 last_msg = time.time()  # clouds still have queued work — keep waiting
-            elif time.time() - last_msg >= idle_grace_s:
-                return
+            elif time.time() - last_msg >= self._fps_grace_s:
+                return "work queues drained + grace"
             time.sleep(0.2)
 
-    def _print_fps_summary(self):
+    def _finish_fps(self, reason=""):
         """Exact system FPS = frames / wall-clock time. Two anchors are shown:
-        START→last DONE (whole run incl. warm-up: model load + first batch) and
-        first→last DONE (steady state). The arithmetic mean of per-DONE 1/delta
-        values is printed only as a reference — bursty arrivals make it read
-        far above the rate the system actually sustained."""
-        n = len(self._done_times)
-        if n < 2:
-            src.Log.print_with_color(
-                "[FPS] Fewer than 2 'DONE' pings received — cannot compute FPS.", "yellow")
+        START→last DONE (whole run incl. warm-up: pipeline fill after dispatch)
+        and first→last DONE (steady state, best for comparing configs). The
+        arithmetic mean of per-gap 1/dt values is printed only as a reference —
+        bursty arrivals make it read far above the sustained rate."""
+        if self._fps_printed:
             return
-        t_first, t_last = self._done_times[0], self._done_times[-1]
-        frames = n * self.batch_size
-        span = t_last - t_first
-        steady_fps = (n - 1) * self.batch_size / span if span > 0 else 0.0
-        deltas = [b - a for a, b in zip(self._done_times, self._done_times[1:])]
-        inst = [self.batch_size / d for d in deltas if d > 0]
-        arith_mean = sum(inst) / len(inst) if inst else 0.0
-
+        self._fps_printed = True
+        t, n, bs = self._fps_times, len(self._fps_times), self.batch_size
         print("=" * 60)
-        print(f"  [FPS SUMMARY]  batches={n}  frames={frames}")
-        if self._run_start_ts is not None:
-            total = t_last - self._run_start_ts
-            total_fps = frames / total if total > 0 else 0.0
-            print(f"  TOTAL TIME (START -> last DONE) = {total:.2f}s")
-            print(f"  SYSTEM FPS (frames/total time)  = {total_fps:.3f}")
-        print(f"  first->last DONE span = {span:.2f}s  -> steady-state FPS = {steady_fps:.3f}")
-        print(f"  (mean of per-DONE 1/delta fps = {arith_mean:.3f} — inflated by bursts, reference only)")
+        if n >= 1 and self._fps_start_t is not None and t[-1] > self._fps_start_t:
+            total_time = t[-1] - self._fps_start_t
+            system_fps = n * bs / total_time
+            print(f"  [SYSTEM FPS]      {system_fps:8.3f} fps   "
+                  f"= {n} DONE x {bs} / {total_time:.2f}s  (START -> last DONE)")
+            if n >= 2 and t[-1] > t[0]:
+                span = t[-1] - t[0]
+                steady = (n - 1) * bs / span
+                print(f"  [steady-state]    {steady:8.3f} fps   "
+                      f"= {n - 1} x {bs} / {span:.2f}s  (first -> last DONE)")
+            if n >= 2:
+                gaps = [t[i] - t[i - 1] for i in range(1, n) if t[i] > t[i - 1]]
+                if gaps:
+                    ref_mean = sum(bs / g for g in gaps) / len(gaps)
+                    print(f"  [ref mean, N/U]   {ref_mean:8.3f} fps   "
+                          f"(arithmetic mean of 1/dt — reference only, biased high)")
+        else:
+            print("  [SYSTEM FPS]      no DONEs received — nothing to report")
+        print(f"  batches counted: {n}   stop reason: {reason}")
         print("=" * 60)
 
     def start(self):
         self.channel.start_consuming()
         # STOP has been broadcast, but clouds may still be finishing their
-        # backlog — keep collecting fps pings until the queue goes quiet,
-        # then print the final system FPS.
-        self._drain_fps_pings()
-        self._print_fps_summary()
+        # backlog — keep collecting fps pings until the queues go quiet,
+        # then print the final system FPS summary.
+        reason = self._drain_fps_pings()
+        self._finish_fps(reason)
         self.connection.close()
         sys.exit(0)
 
@@ -492,9 +506,9 @@ class Server:
                 }
                 self.send_to_response(client_id, pickle.dumps(response))
 
-            # Inference effectively starts now — anchor for TOTAL TIME and the
-            # exact SYSTEM FPS (frames / total time) in the final summary.
-            self._run_start_ts = time.time()
+            # Inference effectively starts now — anchor for the exact
+            # SYSTEM FPS (frames / START->last-DONE time) in the final summary.
+            self._fps_start_t = time.time()
         else:
             response = {"action": "STOP", "message": "Stop inference !!!"}
             for (client_id, layer_id) in self.list_clients:

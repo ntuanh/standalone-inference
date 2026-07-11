@@ -29,14 +29,14 @@ rabbit:
   #
   # intermediate_queue: heavy, carries raw image batches (~MB each). Cap small.
   #   broker RAM for this queue ≈ max-queue-messages × per-message size.
-  max-queue-messages: 1
+  max-queue-messages: 4
   # bbox_queue: light, carries edge-computed bboxes (~KB text). Cap can be deep.
   #   If unset, falls back to max-queue-messages.
   bbox-max-queue-messages: 20
   overflow: reject-publish
 
 debug-mode: False
-data: video.mp4
+data: videohungyen.mp4
 log-path: .
 
 fps:                      # optional; defaults shown

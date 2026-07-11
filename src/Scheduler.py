@@ -54,6 +54,10 @@ class Scheduler:
         # (see Server.on_fps_done). Unbounded — pings are a few hundred bytes.
         self.fps_queue = "fps_queue"
         self.channel.queue_declare(self.fps_queue, durable=False)
+        # Whole-run utilization reports (one per device, sent after "end") go
+        # here; the server collects them at shutdown into utilization.log.
+        self.utilization_queue = "utilization_queue"
+        self.channel.queue_declare(self.utilization_queue, durable=False)
         self._my_metrics_queue = None  # set by _setup_metrics_fanout_queue
         # Publisher confirms (enabled lazily on the edge in first_layer) let the
         # broker NACK a publish that hit the reject-publish overflow ceiling, so
@@ -142,6 +146,7 @@ class Scheduler:
                 self.channel.queue_declare(self.bbox_queue, durable=False,
                                            arguments=get_bbox_queue_args())
                 self.channel.queue_declare(self.fps_queue, durable=False)
+                self.channel.queue_declare(self.utilization_queue, durable=False)
                 if self._confirms_enabled:
                     self._confirms_enabled = False
                     self._enable_publisher_confirms()
@@ -361,6 +366,80 @@ class Scheduler:
         with open(out, "w") as f:
             json.dump({str(k): v for k, v in sorted(self._det_results.items())}, f)
         Log.print_with_color(f"[Tracker] Saved {out} ({len(self._det_results)} frames)", "green")
+
+    def _compute_utilization(self, log_path, role):
+        """Read a timing log back ("<ns> start / get input / output / end") and
+        compute ONE whole-run utilization for this device: total busy time
+        (sum over every 'get input' -> 'output' interval) / total time
+        ('start' -> 'end'). Extra events like queue_wait_start/end are ignored.
+        Returns a stats dict for _send_utilization, or None on a bad log."""
+        if not os.path.exists(log_path):
+            return None
+        t_start = t_end = t_input = None
+        busy_ns = 0
+        n_packages = 0
+        try:
+            with open(log_path) as f:
+                for line in f:
+                    parts = line.strip().split(" ", 1)
+                    if len(parts) != 2 or not parts[0].isdigit():
+                        continue
+                    ts, event = int(parts[0]), parts[1]
+                    if event == "start":
+                        t_start = ts
+                    elif event == "get input":
+                        t_input = ts
+                    elif event == "output":
+                        if t_input is not None:
+                            busy_ns += ts - t_input
+                            n_packages += 1
+                            t_input = None
+                    elif event == "end":
+                        t_end = ts
+        except Exception as e:
+            Log.print_with_color(f"[Utilization][{role}] parse failed for {log_path}: {e}", "yellow")
+            return None
+        if t_start is None or t_end is None or t_end <= t_start:
+            Log.print_with_color(f"[Utilization][{role}] incomplete log {log_path}, skipped", "yellow")
+            return None
+        total_ns = t_end - t_start
+        util = busy_ns / total_ns
+        Log.print_with_color(
+            f"[Utilization][{role}] packages={n_packages} "
+            f"busy={busy_ns / 1e9:.3f}s total={total_ns / 1e9:.3f}s "
+            f"utilization={util * 100:.2f}%", "green")
+        return {
+            "role": role,
+            "packages": n_packages,
+            "busy_ns": busy_ns,
+            "total_ns": total_ns,
+            "utilization": util,
+        }
+
+    def _send_utilization(self, stats):
+        """Publish this device's whole-run utilization report to the server
+        (utilization_queue); the server appends it to its utilization log."""
+        if stats is None:
+            return
+        body = pickle.dumps({
+            "action": "UTILIZATION",
+            "client_id": self.client_id,
+            "layer_id": self.layer_id,
+            **stats,
+        })
+        for attempt in range(2):
+            try:
+                self.channel.queue_declare(self.utilization_queue, durable=False)
+                self.channel.basic_publish(
+                    exchange='', routing_key=self.utilization_queue, body=body)
+                return
+            except self._CONN_ERRORS:
+                if attempt == 0:
+                    self._reconnect()
+            except Exception as e:
+                Log.print_with_color(f"[Utilization] send failed: {e}", "yellow")
+                return
+        Log.print_with_color("[Utilization] send failed after reconnect", "yellow")
 
     def send_to_server(self, message):
         self.channel.queue_declare('rpc_queue', durable=False)
@@ -625,6 +704,7 @@ class Scheduler:
                 continue
         with open(self._timing_log_edge, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
+        self._send_utilization(self._compute_utilization(self._timing_log_edge, "edge"))
         print(f'size message: {self.size_message} bytes.')
         cap.release()
         pbar.close()
@@ -843,6 +923,7 @@ class Scheduler:
 
         with open(self._timing_log_cloud, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
+        self._send_utilization(self._compute_utilization(self._timing_log_cloud, "cloud"))
         try:
             cv2.destroyAllWindows()
         except Exception:

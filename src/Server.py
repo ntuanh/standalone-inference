@@ -84,6 +84,14 @@ class Server:
         self.channel.queue_declare(queue='fps_queue', durable=False)
         self.channel.queue_purge(queue='fps_queue')
 
+        # utilization_queue: each device publishes ONE whole-run utilization
+        # report (total busy time across all its packages / start->end span)
+        # after it finishes. Collected in _collect_utilization at shutdown —
+        # the clouds only send theirs after STOP, when rpc_queue consuming has
+        # already stopped, so a dedicated queue is required.
+        self.channel.queue_declare(queue='utilization_queue', durable=False)
+        self.channel.queue_purge(queue='utilization_queue')
+
         self.register_clients = [0 for _ in range(len(self.total_clients))]
         self.list_clients = []
         self.registered_ids = set()
@@ -128,6 +136,10 @@ class Server:
         # previous one.
         self.batch_log_path = f"{log_path}/batch_done_ns.log"
         open(self.batch_log_path, "w").close()
+        # One line per device: whole-run utilization reported by the client.
+        # Truncated at every server start so runs never mix.
+        self.utilization_log_path = f"{log_path}/utilization.log"
+        open(self.utilization_log_path, "w").close()
         self.logger = src.Log.Logger(f"{log_path}/app.log", config["debug-mode"])
         self.logger.log_info(f"Application start. Server is waiting for {self.total_clients} clients.")
         src.Log.print_with_color(f"Application start. Server is waiting for {self.total_clients} clients.", "green")
@@ -307,6 +319,46 @@ class Server:
         print(f"  batches counted: {n}   stop reason: {reason}")
         print("=" * 60)
 
+    def _collect_utilization(self, timeout_s=30.0):
+        """Every device sends ONE whole-run utilization report (busy time over
+        all its packages / start->end span) after it finishes. Gather them from
+        utilization_queue — until every registered client has reported or
+        timeout_s passes — and append each to the utilization log file."""
+        expected = len(set(cid for cid, _ in self.list_clients))
+        got = 0
+        deadline = time.time() + timeout_s
+        while got < expected and time.time() < deadline:
+            try:
+                method_frame, _, body = self.channel.basic_get(
+                    queue='utilization_queue', auto_ack=True)
+            except Exception:
+                break
+            if not method_frame:
+                time.sleep(0.2)
+                continue
+            try:
+                msg = pickle.loads(body)
+            except Exception:
+                continue
+            if msg.get("action") != "UTILIZATION":
+                continue
+            got += 1
+            line = (f"{time.time_ns()} client={msg.get('client_id')} "
+                    f"role={msg.get('role')} packages={msg.get('packages')} "
+                    f"busy_s={msg.get('busy_ns', 0) / 1e9:.3f} "
+                    f"total_s={msg.get('total_ns', 0) / 1e9:.3f} "
+                    f"utilization={msg.get('utilization', 0) * 100:.2f}%")
+            with open(self.utilization_log_path, "a") as f:
+                f.write(line + "\n")
+            src.Log.print_with_color(f"[Utilization] {line}", "green")
+        if got < expected:
+            src.Log.print_with_color(
+                f"[Utilization] Collected {got}/{expected} reports before timeout — "
+                f"see {self.utilization_log_path}", "yellow")
+        elif got:
+            src.Log.print_with_color(
+                f"[Utilization] Saved {got} device reports to {self.utilization_log_path}", "green")
+
     def start(self):
         self.channel.start_consuming()
         # STOP has been broadcast, but clouds may still be finishing their
@@ -314,6 +366,9 @@ class Server:
         # then print the final system FPS summary.
         reason = self._drain_fps_pings()
         self._finish_fps(reason)
+        # Devices (clouds included, which finish only after STOP) each send one
+        # whole-run utilization report — persist them before shutting down.
+        self._collect_utilization()
         self.connection.close()
         sys.exit(0)
 

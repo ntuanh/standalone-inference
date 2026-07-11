@@ -29,7 +29,7 @@ rabbit:
   #
   # intermediate_queue: heavy, carries raw image batches (~MB each). Cap small.
   #   broker RAM for this queue ≈ max-queue-messages × per-message size.
-  max-queue-messages: 4
+  max-queue-messages: 2
   # bbox_queue: light, carries edge-computed bboxes (~KB text). Cap can be deep.
   #   If unset, falls back to max-queue-messages.
   bbox-max-queue-messages: 20

@@ -58,7 +58,23 @@ class Scheduler:
         # here; the server collects them at shutdown into utilization.log.
         self.utilization_queue = "utilization_queue"
         self.channel.queue_declare(self.utilization_queue, durable=False)
+        # Control-plane events (adaptive route flips). The server timestamps the
+        # ARRIVAL on its own clock and writes events_ns.log, so the events share
+        # a clock with every other server-side series and can be overlaid on a
+        # time-axis chart.
+        self.events_queue = "events_queue"
+        self.channel.queue_declare(self.events_queue, durable=False)
         self._my_metrics_queue = None  # set by _setup_metrics_fanout_queue
+
+        # Raw per-unit latency samples, shipped as arrays with this device's
+        # utilization report at shutdown. Raw, never pre-reduced: percentiles
+        # cannot validly be averaged across devices, so the SERVER pools these
+        # and takes nearest-rank percentiles once (guide/04-latency.md §1).
+        self._service_ms = []    # own 'get input' -> 'output'; sums to busy_s
+        self._pipeline_ms = []   # unit first exists here -> its output published
+        self._e2e_ms = []        # first-stage start -> output; ONLY when this
+                                 # device is the tier that completed the unit
+        self._route_last = None  # adaptive: last routing decision, for events
         # Publisher confirms (enabled lazily on the edge in first_layer) let the
         # broker NACK a publish that hit the reject-publish overflow ceiling, so
         # _publish_intermediate can wait+retry instead of silently dropping it.
@@ -147,6 +163,7 @@ class Scheduler:
                                            arguments=get_bbox_queue_args())
                 self.channel.queue_declare(self.fps_queue, durable=False)
                 self.channel.queue_declare(self.utilization_queue, durable=False)
+                self.channel.queue_declare(self.events_queue, durable=False)
                 if self._confirms_enabled:
                     self._confirms_enabled = False
                     self._enable_publisher_confirms()
@@ -416,6 +433,41 @@ class Scheduler:
             "utilization": util,
         }
 
+    def _send_done(self):
+        """Publish exactly one completion ping per finished batch, tagged with
+        this device's cluster id. The body is an IDENTITY, never a measurement:
+        the server times the arrival on its own clock, so a garbled body can
+        mis-bucket one batch in the per-cluster breakdown but can never distort
+        a rate (guide/02-throughput.md §3). Telemetry never kills the run."""
+        try:
+            self.channel.basic_publish(exchange='', routing_key=self.fps_queue,
+                                       body=str(self.intermediate_queue).encode())
+        except Exception as e:
+            Log.print_with_color(f"[FPS] send DONE failed: {e}", "yellow")
+
+    def _send_event(self, description):
+        """Report one control-plane decision. The server stamps its own clock on
+        arrival and appends it to events_ns.log, for overlaying as a vertical
+        rule on the throughput timeline."""
+        try:
+            self.channel.basic_publish(
+                exchange='', routing_key=self.events_queue,
+                body=pickle.dumps({"action": "EVENT",
+                                   "scope": str(self.intermediate_queue),
+                                   "description": description}))
+        except Exception as e:
+            Log.print_with_color(f"[Event] send failed: {e}", "yellow")
+
+    def _note_route(self, route_path):
+        """Adaptive mode picks a route per batch; only the FLIPS are events.
+        Logging every batch would bury the timeline in noise, and the decision
+        that matters is 'the controller changed its mind here'."""
+        if route_path == self._route_last:
+            return
+        word = "cloud has capacity" if route_path == "split" else "cloud backlogged"
+        self._send_event(f"route {self._route_last or 'start'}->{route_path} ({word})")
+        self._route_last = route_path
+
     def _send_utilization(self, stats):
         """Publish this device's whole-run utilization report to the server
         (utilization_queue); the server appends it to its utilization log."""
@@ -425,6 +477,13 @@ class Scheduler:
             "action": "UTILIZATION",
             "client_id": self.client_id,
             "layer_id": self.layer_id,
+            # Cluster id, so the server can roll utilization and latency up per
+            # cluster (utilization_cluster.log / latency_cluster.log).
+            "cluster": str(self.intermediate_queue),
+            # Raw samples — the server pools across devices before reducing.
+            "service_ms": self._service_ms,
+            "pipeline_ms": self._pipeline_ms,
+            "e2e_ms": self._e2e_ms,
             **stats,
         })
         for attempt in range(2):
@@ -468,6 +527,7 @@ class Scheduler:
         pbar = tqdm(desc="Processing video (while loop)", unit="frame")
         batch_id = 0
         prev_batch_end = None
+        batch_first_frame_ns = None
         with open(self._timing_log_edge, "w") as _tf:
             print(str(time.time_ns()) + " start", file=_tf)
         while True:
@@ -477,13 +537,22 @@ class Scheduler:
             frame = cv2.resize(frame, (640, 640))
             frame = frame.astype('float32') / 255.0
             tensor = torch.from_numpy(frame).permute(2, 0, 1)  # shape: (3, 640, 640)
+            if not input_image:
+                # The batch starts existing with its first frame — the anchor for
+                # the 'pipeline' latency, which therefore includes the wait while
+                # the rest of the batch is captured.
+                batch_first_frame_ns = time.time_ns()
             input_image.append(tensor)
 
             if len(input_image) == batch_size:
                 t_batch_ready = time.perf_counter()
                 gap_ms = (t_batch_ready - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
+                # Reuse this exact reading for both the timing log and the
+                # 'service' sample, so Σ service == busy_s holds by construction
+                # (guide/04-latency.md §2.1) instead of approximately.
+                t_get_input_ns = time.time_ns()
                 with open(self._timing_log_edge, "a") as _tf:
-                    print(str(time.time_ns()) + " get input", file=_tf)
+                    print(str(t_get_input_ns) + " get input", file=_tf)
                 batch_start = time.perf_counter()
                 edge_start_wall = time.time()
 
@@ -562,9 +631,13 @@ class Scheduler:
                 # ===== ADAPTIVE (full cloud  OR  full edge, decided per batch) =====
                 elif mode == "adaptive":
                     depth = self._get_queue_depth(self.intermediate_queue)
-                    if depth == 0:
+                    # Decide, report the flip, then act — so the server's arrival
+                    # timestamp marks when the controller changed its mind rather
+                    # than when the resulting batch happened to finish.
+                    route_path = "split" if depth == 0 else "edge_only"
+                    self._note_route(route_path)
+                    if route_path == "split":
                         # --- Cloud has capacity → offload raw frames (full cloud YOLO) ---
-                        route_path = "split"
                         frames_cpu = input_image  # still on CPU
                         y = {
                             "data": [frames_cpu[i].clone() for i in range(len(frames_cpu))],
@@ -581,7 +654,6 @@ class Scheduler:
                         send_ms = (time.perf_counter() - _send_start) * 1000
                     else:
                         # --- Cloud backlogged → run full YOLO locally, ship bboxes ---
-                        route_path = "edge_only"
                         input_image = input_image.to(self.device)
 
                         _inf_start = time.perf_counter()
@@ -636,14 +708,31 @@ class Scheduler:
                     )
                     send_ms = (time.perf_counter() - _send_start) * 1000
                 batch_end = time.perf_counter()
+                t_output_ns = time.time_ns()
                 with open(self._timing_log_edge, "a") as _tf:
-                    print(str(time.time_ns()) + " output", file=_tf)
+                    print(str(t_output_ns) + " output", file=_tf)
+                # Raw per-unit latency samples (guide/04-latency.md). 'service' is
+                # exactly the interval _compute_utilization sums into busy_s.
+                # 'pipeline' additionally covers the wait while the batch filled
+                # up with frames, so pipeline >> service means this edge is
+                # starved by capture, not by compute.
+                self._service_ms.append((t_output_ns - t_get_input_ns) / 1e6)
+                if batch_first_frame_ns is not None:
+                    self._pipeline_ms.append((t_output_ns - batch_first_frame_ns) / 1e6)
                 latency_ms = (batch_end - batch_start) * 1000
                 # FPS = frames / time spent actually processing this batch (not the
                 # gap since the last batch), so idle/capture waits don't distort it.
                 _proc_s = batch_end - batch_start
                 fps = batch_size / _proc_s if _proc_s > 0 else 0.0
-                e2e_latency_ms = 0.0
+                # e2e is reported by the COMPLETING tier only, so each unit is
+                # counted exactly once. When the edge finishes the unit itself the
+                # span stays on one clock and is therefore exact; cloud-completed
+                # batches are reported by the cloud instead.
+                edge_completes = (mode == "only_edge" or route_path == "edge_only")
+                e2e_latency_ms = ((t_output_ns / 1e9 - edge_start_wall) * 1000
+                                  if edge_completes else 0.0)
+                if edge_completes:
+                    self._e2e_ms.append(e2e_latency_ms)
                 _ram_start = time.perf_counter()
                 ram_mb = self.get_ram_mb()
                 ram_ms = (time.perf_counter() - _ram_start) * 1000
@@ -674,17 +763,13 @@ class Scheduler:
                 )
                 write_ms = (time.perf_counter() - _write_start) * 1000
 
-                # Bare "DONE" ping → fps_queue when the EDGE is the tier that
+                # Completion ping → fps_queue when the EDGE is the tier that
                 # completed this batch (only_edge, or adaptive routed edge_only).
                 # In split/only_cloud the cloud finishes the batch and pings
-                # instead — exactly one ping per batch system-wide. The server
-                # computes system FPS as batch_size / delta between DONEs.
-                if mode == "only_edge" or route_path == "edge_only":
-                    try:
-                        self.channel.basic_publish(
-                            exchange='', routing_key=self.fps_queue, body=b"DONE")
-                    except Exception as e:
-                        Log.print_with_color(f"[FPS] ping publish failed: {e}", "yellow")
+                # instead — exactly one ping per batch system-wide, which is what
+                # keeps the server's rate from reading 2x real.
+                if edge_completes:
+                    self._send_done()
 
                 batch_interval_ms = (batch_end - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
                 Log.print_with_color(
@@ -771,8 +856,11 @@ class Scheduler:
             if method_frame and body:
                 t_batch_ready = time.perf_counter()
                 gap_ms = (t_batch_ready - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
+                # One reading, used for both the timing log and the 'service'
+                # sample, so Σ service == busy_s holds exactly.
+                t_get_input_ns = time.time_ns()
                 with open(self._timing_log_cloud, "a") as _tf:
-                    print(str(time.time_ns()) + " get input", file=_tf)
+                    print(str(t_get_input_ns) + " get input", file=_tf)
                 batch_start = time.perf_counter()
                 received_message_size = len(body)
                 received_data = pickle.loads(body)
@@ -845,9 +933,17 @@ class Scheduler:
                     postprocess_ms = (time.perf_counter() - _post_start) * 1000
 
                 batch_end = time.perf_counter()
+                t_output_ns = time.time_ns()
                 with open(self._timing_log_cloud, "a") as _tf:
-                    print(str(time.time_ns()) + " output", file=_tf)
-                cloud_end_wall = time.time()
+                    print(str(t_output_ns) + " output", file=_tf)
+                cloud_end_wall = t_output_ns / 1e9
+                # The cloud pulls one message at a time and handles it inline —
+                # there is no in-process hand-off queue between receive and
+                # compute here, so 'pipeline' equals 'service' by construction on
+                # this tier. It is emitted anyway so the pair stays comparable
+                # against the edge, where the two genuinely differ.
+                self._service_ms.append((t_output_ns - t_get_input_ns) / 1e6)
+                self._pipeline_ms.append((t_output_ns - t_get_input_ns) / 1e6)
                 latency_ms = (batch_end - batch_start) * 1000
                 # FPS from processing time only. For edge_only batches the cloud did
                 # no inference (just logged a bbox) → fps is meaningless, leave it 0
@@ -857,7 +953,13 @@ class Scheduler:
                     fps = 0.0
                 else:
                     fps = batch_size / _proc_s if _proc_s > 0 else 0.0
+                # Spans two machines by definition, so it inherits any offset
+                # between their clocks — indicative, not exact (guide/04 §2.3).
+                # Sampled only for batches the CLOUD completed; adaptive bbox
+                # messages were completed, and already reported, by the edge.
                 e2e_latency_ms = (cloud_end_wall - edge_start_time) * 1000
+                if eff != "only_edge":
+                    self._e2e_ms.append(e2e_latency_ms)
                 _ram_start = time.perf_counter()
                 ram_mb = self.get_ram_mb()
                 ram_ms = (time.perf_counter() - _ram_start) * 1000
@@ -879,17 +981,13 @@ class Scheduler:
                 )
                 write_ms = (time.perf_counter() - _write_start) * 1000
 
-                # Bare "DONE" ping → fps_queue when the CLOUD is the tier that
+                # Completion ping → fps_queue when the CLOUD is the tier that
                 # completed this batch (split / only_cloud / adaptive split-path).
                 # only_edge results and adaptive bbox messages are skipped — the
                 # edge already pinged those batches, keeping the system at
-                # exactly one ping per batch so the server's 1/delta FPS holds.
+                # exactly one ping per batch.
                 if eff != "only_edge":
-                    try:
-                        self.channel.basic_publish(
-                            exchange='', routing_key=self.fps_queue, body=b"DONE")
-                    except Exception as e:
-                        Log.print_with_color(f"[FPS] ping publish failed: {e}", "yellow")
+                    self._send_done()
 
                 batch_interval_ms = (batch_end - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
                 Log.print_with_color(

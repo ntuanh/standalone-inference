@@ -8,6 +8,7 @@ import pika
 import pickle
 import src.Model
 import src.Log
+import src.Results
 from src.Utils import get_intermediate_queue_args, get_bbox_queue_args
 from ultralytics import YOLO
 
@@ -92,6 +93,13 @@ class Server:
         self.channel.queue_declare(queue='utilization_queue', durable=False)
         self.channel.queue_purge(queue='utilization_queue')
 
+        # events_queue: control-plane decisions (adaptive route flips) reported by
+        # the edges. The server stamps ARRIVAL on its own clock, so events share a
+        # clock with every other server-side series and can be drawn as vertical
+        # rules on the throughput timeline.
+        self.channel.queue_declare(queue='events_queue', durable=False)
+        self.channel.queue_purge(queue='events_queue')
+
         self.register_clients = [0 for _ in range(len(self.total_clients))]
         self.list_clients = []
         self.registered_ids = set()
@@ -114,6 +122,11 @@ class Server:
         # instantaneous 1/delta values is NOT used: bursty arrivals (tiny
         # deltas → huge fps entries) inflate it far above the real rate.
         self._fps_times = []          # arrival time (s) of every DONE
+        # Same arrivals, bucketed by the cluster id carried in the ping body. The
+        # system list above stays authoritative, so the breakdown is strictly
+        # additive in done/frames and a mis-tagged batch can shift the split but
+        # can never move the total.
+        self._fps_cluster_times = {}  # cluster -> [arrival time (s), ...]
         self._fps_start_t = None      # when START was broadcast to clients
         self._fps_window = 16         # DONEs per live smoothed sample
         self._fps_printed = False
@@ -126,20 +139,31 @@ class Server:
         # cannot shut down before the clouds finish the backlog.
         self._work_queues = ["intermediate_queue", "bbox_queue"]
         self.channel.basic_consume(queue='fps_queue', on_message_callback=self.on_fps_done)
+        self.channel.basic_consume(queue='events_queue', on_message_callback=self.on_event)
 
         self.data = config["data"]
         self.compress = config["compress"]
 
-        log_path = config["log-path"]
-        # Per-batch ns-epoch log: one line per DONE, "<ns> [<window_fps>]".
-        # Truncated at every server start so a new run never mixes with the
-        # previous one.
-        self.batch_log_path = f"{log_path}/batch_done_ns.log"
-        open(self.batch_log_path, "w").close()
-        # One line per device: whole-run utilization reported by the client.
-        # Truncated at every server start so runs never mix.
-        self.utilization_log_path = f"{log_path}/utilization.log"
-        open(self.utilization_log_path, "w").close()
+        self.log_path = log_path = config["log-path"]
+        # The seven result files (guide/01-result-format.md §2), 'cluster' naming
+        # scheme. ALL of them are truncated here — once, centrally, before any
+        # worker can write — so a results directory always describes exactly one
+        # run. Truncating a file only when the feature that writes it is enabled
+        # is the trap in 05 §4: a later run inherits the previous run's file and
+        # the archiver stamps stale data into a fresh archive.
+        self.result_files = {
+            "batch":   f"{log_path}/batch_done_ns.log",        # system rate series
+            "rate_ns": f"{log_path}/fps_cluster_ns.log",       # per-cluster series
+            "rate":    f"{log_path}/fps_cluster.log",          # rate summary
+            "util":    f"{log_path}/utilization.log",          # per device
+            "util_c":  f"{log_path}/utilization_cluster.log",  # rolled up
+            "lat":     f"{log_path}/latency_cluster.log",      # distributions
+            "events":  f"{log_path}/events_ns.log",            # control plane
+        }
+        for path in self.result_files.values():
+            open(path, "w").close()
+        self.batch_log_path = self.result_files["batch"]
+        self.utilization_log_path = self.result_files["util"]
         self.logger = src.Log.Logger(f"{log_path}/app.log", config["debug-mode"])
         self.logger.log_info(f"Application start. Server is waiting for {self.total_clients} clients.")
         src.Log.print_with_color(f"Application start. Server is waiting for {self.total_clients} clients.", "green")
@@ -219,17 +243,31 @@ class Server:
         src.Log.print_with_color(f"[>>>] Sent notification to client {client_id}", "red")
         self.reply_channel.basic_publish(exchange='', routing_key=reply_queue_name, body=message)
 
-    def _record_fps_done(self):
+    @staticmethod
+    def _cluster_of(body):
+        """The ping body carries only the producing cluster's id — an identity,
+        never a measurement. A body we don't recognise (e.g. an older worker that
+        still sends a bare constant) is bucketed as 'unknown' rather than dropped,
+        so a stale worker degrades the breakdown instead of losing batches."""
+        try:
+            name = (body or b"").decode().strip()
+        except Exception:
+            return "unknown"
+        return name if name.startswith("intermediate_queue") else "unknown"
+
+    def _record_fps_done(self, cluster="unknown"):
         """One batch (batch_size frames) fully handled somewhere in the system —
-        whichever tier (edge or cloud) completed it published a bare "DONE".
-        Take ONE clock reading and derive both the FPS math and the ns log line
-        from it, so the logged timestamp is exactly the arrival the math used.
-        The live smoothed view only starts once a full window of arrivals
-        exists; the first W-1 batches log the bare timestamp."""
+        whichever tier (edge or cloud) completed it published a ping tagged with
+        its cluster. Take ONE clock reading and derive the FPS math and both ns
+        log lines from it, so the logged timestamp is exactly the arrival the
+        math used. The live smoothed view only starts once a full window of
+        arrivals exists; the first W-1 batches log the bare timestamp."""
         t_ns = time.time_ns()
-        self._fps_times.append(t_ns / 1e9)
-        n = len(self._fps_times)
+        t_s = t_ns / 1e9
         W = self._fps_window
+
+        self._fps_times.append(t_s)
+        n = len(self._fps_times)
         window_fps = None
         if n >= W:
             span = self._fps_times[-1] - self._fps_times[-W]
@@ -243,9 +281,37 @@ class Server:
             else:
                 f.write(f"{t_ns} {window_fps:.2f}\n")
 
+        # Per-cluster series. Each cluster runs its OWN window counter, so it
+        # reaches its first full window later than the system does — that is
+        # correct, not a bug. Exactly one line here per line above, which is the
+        # conformance check the validator runs.
+        times = self._fps_cluster_times.setdefault(cluster, [])
+        times.append(t_s)
+        c_n = len(times)
+        line = f"{t_ns} cluster={cluster} done={c_n}"
+        if c_n >= W:
+            c_span = times[-1] - times[-W]
+            if c_span > 0:
+                line += f" window_fps={(W - 1) * self.batch_size / c_span:.2f}"
+        with open(self.result_files["rate_ns"], "a") as f:
+            f.write(line + "\n")
+
     def on_fps_done(self, ch, method, _, body):
-        # body (b"DONE") is intentionally ignored — the arrival is the event.
-        self._record_fps_done()
+        # The arrival is the event; the body is read ONLY to bucket this batch.
+        self._record_fps_done(self._cluster_of(body))
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+
+    def on_event(self, ch, method, _, body):
+        """Append one control-plane decision to events_ns.log, timestamped on the
+        server's clock like every other shared series."""
+        try:
+            msg = pickle.loads(body)
+            line = f"{time.time_ns()} {msg.get('scope', 'system')}: {msg.get('description', '')}"
+            with open(self.result_files["events"], "a") as f:
+                f.write(line + "\n")
+            src.Log.print_with_color(f"[Event] {line}", "cyan")
+        except Exception as e:
+            src.Log.print_with_color(f"[Event] dropped malformed event: {e}", "yellow")
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
     def _queue_depth(self, qname):
@@ -277,7 +343,7 @@ class Server:
             except Exception:
                 return "fps_queue unreachable"
             if method_frame:
-                self._record_fps_done()
+                self._record_fps_done(self._cluster_of(body))
                 last_msg = time.time()
                 continue
             backlog = sum(self._queue_depth(q) for q in self._work_queues)
@@ -318,6 +384,40 @@ class Server:
             print("  [SYSTEM FPS]      no DONEs received — nothing to report")
         print(f"  batches counted: {n}   stop reason: {reason}")
         print("=" * 60)
+        self._write_rate_summary()
+
+    def _write_rate_summary(self):
+        """fps_cluster.log — one line per cluster plus a SYSTEM line. Written from
+        the same arrival lists the console summary used, so the file and the
+        console can never disagree."""
+        lines = src.Results.rate_summary_lines(
+            time.time_ns(), self._fps_cluster_times, self._fps_start_t, self.batch_size)
+        if not lines:
+            return
+        with open(self.result_files["rate"], "w") as f:
+            f.write("\n".join(lines) + "\n")
+        for line in lines:
+            src.Log.print_with_color(f"[FPS] {line}", "cyan")
+
+    def _drain_events(self):
+        """Pick up any control event still on the queue after stop_consuming().
+        The edges publish these during their run, so in practice the live
+        consumer has them all — this only closes the race on the very last one."""
+        while True:
+            try:
+                method_frame, _, body = self.channel.basic_get(
+                    queue='events_queue', auto_ack=True)
+            except Exception:
+                return
+            if not method_frame:
+                return
+            try:
+                msg = pickle.loads(body)
+                with open(self.result_files["events"], "a") as f:
+                    f.write(f"{time.time_ns()} {msg.get('scope', 'system')}: "
+                            f"{msg.get('description', '')}\n")
+            except Exception:
+                continue
 
     def _collect_utilization(self, timeout_s=30.0):
         """Every device sends ONE whole-run utilization report (busy time over
@@ -326,6 +426,7 @@ class Server:
         timeout_s passes — and append each to the utilization log file."""
         expected = len(set(cid for cid, _ in self.list_clients))
         got = 0
+        reports = []
         deadline = time.time() + timeout_s
         while got < expected and time.time() < deadline:
             try:
@@ -343,6 +444,7 @@ class Server:
             if msg.get("action") != "UTILIZATION":
                 continue
             got += 1
+            reports.append(msg)
             line = (f"{time.time_ns()} client={msg.get('client_id')} "
                     f"role={msg.get('role')} packages={msg.get('packages')} "
                     f"busy_s={msg.get('busy_ns', 0) / 1e9:.3f} "
@@ -351,6 +453,7 @@ class Server:
             with open(self.utilization_log_path, "a") as f:
                 f.write(line + "\n")
             src.Log.print_with_color(f"[Utilization] {line}", "green")
+        # A partial collection is acceptable — warn, but never abort the run.
         if got < expected:
             src.Log.print_with_color(
                 f"[Utilization] Collected {got}/{expected} reports before timeout — "
@@ -358,6 +461,44 @@ class Server:
         elif got:
             src.Log.print_with_color(
                 f"[Utilization] Saved {got} device reports to {self.utilization_log_path}", "green")
+        self._write_rollups(reports)
+
+    def _write_rollups(self, reports):
+        """Roll the same per-device reports up per cluster (utilization) and pool
+        their raw latency samples per scope (latency). Both derive from one
+        collection pass, so the two files describe the same set of devices."""
+        if not reports:
+            return
+        ts_ns = time.time_ns()
+        for key, lines in (("util_c", src.Results.utilization_lines(ts_ns, reports)),
+                           ("lat", src.Results.latency_lines(ts_ns, reports))):
+            if not lines:
+                continue
+            try:
+                with open(self.result_files[key], "w") as f:
+                    f.write("\n".join(lines) + "\n")
+                src.Log.print_with_color(
+                    f"[Results] Wrote {len(lines)} lines to {self.result_files[key]}", "green")
+            except Exception as e:
+                src.Log.print_with_color(f"[Results] {key} write failed: {e}", "yellow")
+
+    def _archive(self):
+        """Snapshot this run's logs plus the config that produced them, after the
+        last shutdown writer has run. Without the config the numbers are
+        unreadable in a month — you will not remember the batch size, the mode,
+        or the queue cap."""
+        tag = src.Results.run_tag(self.config)
+        dest, copied = src.Results.archive_run(
+            self.log_path, self.result_files.values(), tag)
+        if dest is None:
+            src.Log.print_with_color("[Archive] Failed — live logs are still in place.", "yellow")
+        elif copied <= 1:
+            # Only config.yaml made it: every log was empty, so this run measured
+            # nothing. Say so loudly rather than letting it look like a success.
+            src.Log.print_with_color(
+                f"[Archive] {dest} contains NO result data — the run produced nothing.", "red")
+        else:
+            src.Log.print_with_color(f"[Archive] {copied} files -> {dest}", "green")
 
     def start(self):
         self.channel.start_consuming()
@@ -365,10 +506,15 @@ class Server:
         # backlog — keep collecting fps pings until the queues go quiet,
         # then print the final system FPS summary.
         reason = self._drain_fps_pings()
+        self._drain_events()
         self._finish_fps(reason)
         # Devices (clouds included, which finish only after STOP) each send one
-        # whole-run utilization report — persist them before shutting down.
+        # whole-run utilization report plus their raw latency samples — persist
+        # them before shutting down.
         self._collect_utilization()
+        # Archive last: every shutdown writer has now run, so the snapshot is
+        # complete. Archiving is best-effort and never blocks a clean exit.
+        self._archive()
         self.connection.close()
         sys.exit(0)
 

@@ -318,11 +318,13 @@ The **total system FPS** is the sum of the per-device average FPS across all fin
 The server measures **real system throughput** centrally, while the run is going, using a dedicated `fps_queue`:
 
 ```
-edge/cloud finishes a batch  →  publishes "DONE"  →  server records arrival time
+edge/cloud finishes a batch  →  publishes its cluster id  →  server records arrival time
 
 SYSTEM FPS = total frames / total time
            = (number of DONEs × batch_size) / (last DONE − START broadcast)
 ```
+
+The ping body is an **identity** (the producing cluster, e.g. `intermediate_queue_0`), never a measurement. The server reads it only to bucket the arrival for the per-cluster breakdown; the system total counts every arrival regardless of body, so a garbled or unrecognised body can shift the breakdown but can never move the total.
 
 **Who sends the "DONE"** — only the device that *completes* a batch, so one DONE always equals exactly `batch_size` frames and nothing is counted twice:
 
@@ -334,33 +336,69 @@ SYSTEM FPS = total frames / total time
 
 **Why arrival counting instead of averaging rates** — the message body carries no data; the server timestamps each arrival with **its own clock**, so clock differences between devices cannot distort the measurement. Averaging per-batch instantaneous FPS (`batch_size / delta`) is deliberately avoided: DONEs arrive in bursts, and the burst intervals produce huge FPS entries that inflate an arithmetic mean far above the rate the system actually sustains (e.g. a run measured 28.3 fps true throughput while the mean of instantaneous values read 133.7).
 
-**Live output** — the server prints one line per DONE:
+**Live output** — from the 16th DONE on, the server prints the smoothed window rate:
 
 ```
-[FPS] #42 DONE delta=0.512s inst=62.50 | window_fps=64.10 | system_fps=63.87
+[FPS] DONE #42  window_fps= 64.10 (last 16 batches)
 ```
 
-- `inst` — `batch_size / delta` since the previous DONE (noisy, for spotting stalls)
-- `window_fps` — frames over the last ≤16 DONEs (smoothed live view)
-- `system_fps` — cumulative frames / elapsed time (converges to the true rate)
+`window_fps` is `15 × batch_size / (t[-1] − t[-16])` — frames over the last 16 DONEs. The first 15 batches print nothing, because there is no window yet.
 
 **Final summary** — printed when the run ends:
 
 ```
 ============================================================
-  [FPS SUMMARY]  batches=252  frames=8064
-  TOTAL TIME (START -> last DONE) = 284.64s
-  SYSTEM FPS (frames/total time)  = 28.331
-  first->last DONE span = 277.93s  -> steady-state FPS = 28.899
-  (mean of per-DONE 1/delta fps = 133.709 — inflated by bursts, reference only)
+  [SYSTEM FPS]        28.331 fps   = 252 DONE x 32 / 284.64s  (START -> last DONE)
+  [steady-state]      28.899 fps   = 251 x 32 / 277.93s  (first -> last DONE)
+  [ref mean, N/U]    133.709 fps   (arithmetic mean of 1/dt — reference only, biased high)
+  batches counted: 252   stop reason: work queues drained + grace
 ============================================================
 ```
 
 - **SYSTEM FPS** — whole run including warm-up (model load, first batch in flight)
 - **steady-state FPS** — excludes warm-up; use this when comparing modes or cut points
-- **mean of per-DONE 1/delta fps** — arithmetic mean of the instantaneous per-DONE rates; DONEs arrive in bursts so this reads far above real throughput (133.7 vs 28.3 here). Printed for reference only — never use it as the system FPS.
+- **ref mean, N/U** — arithmetic mean of the instantaneous per-DONE rates; DONEs arrive in bursts so this reads far above real throughput (133.7 vs 28.3 here). Printed for reference only — never use it as the system FPS.
 
 **Shutdown safety** — the STOP protocol fires when all edges finish *sending*, but clouds are usually still draining queued batches at that point. The server does not exit then: it keeps collecting DONEs while `intermediate_queue` / `bbox_queue` (and any per-cluster queues) are non-empty, plus a 10 s grace period for the final in-flight batch, so backlog processed after the edges finish is still counted in the summary.
+
+---
+
+## Run Result Files
+
+The server emits the portable result format specified in [`guide/`](guide/) — seven plain-text files in `log-path`, every line starting with a nanosecond-epoch timestamp taken on the **server's** clock followed by `key=value` pairs. All seven are truncated at server startup, so the directory always describes exactly one run.
+
+| File | Written | One line per |
+|---|---|---|
+| `batch_done_ns.log` | live | completed batch (system throughput series) |
+| `fps_cluster_ns.log` | live | completed batch, cluster-tagged |
+| `fps_cluster.log` | shutdown | cluster + one `SYSTEM` line (throughput summary) |
+| `utilization.log` | shutdown | device (busy ratio) |
+| `utilization_cluster.log` | shutdown | cluster, cluster×role, `SYSTEM` |
+| `latency_cluster.log` | shutdown | cluster×role×kind, cluster e2e, `SYSTEM` e2e |
+| `events_ns.log` | live | adaptive route flip |
+
+This project uses the **`cluster`** filename scheme (never mixed with the `group_*` scheme — see `guide/01-result-format.md` §2). How the guide's neutral terms map here:
+
+| Guide term | Here |
+|---|---|
+| unit / unit size | one batch / `server.batch-size` |
+| worker, role | an edge or cloud client; `edge` / `cloud` |
+| group | a cluster — `intermediate_queue`, or `intermediate_queue_k` with Hungarian clustering |
+| completing tier | whichever tier emits the DONE (see the table above) |
+| control event | an adaptive route flip between `split` and `edge_only` |
+
+**Latency kinds** — `service` is a device's own `get input → output`, so it sums exactly to that device's `busy_s`; `pipeline` additionally covers the wait while a batch fills with frames (edge) and equals `service` on the cloud, which has no in-process hand-off queue; `e2e` runs from the edge starting a batch to the completing tier's output and is reported **only** by the tier that completed it, so each batch is counted once. Percentiles are nearest-rank over pooled raw samples — devices ship sample arrays, the server pools then reduces, because percentiles cannot validly be averaged across devices.
+
+**Archiving** — at shutdown the logs plus the `config.yaml` that produced them are copied to `results/results_<MMDD>_<HHMM>_<tag>/`, where `tag` is the mode (`adaptive` / `only_edge` / `only_cloud`) or `dynamic` / `split`. Empty files are skipped and collisions get a `-2` suffix. Archiving is best-effort — a failure warns and the run still exits cleanly.
+
+**Checking conformance** — run the validator on a run directory before charting it:
+
+```bash
+python guide/validate_results.py . --names cluster
+python guide/validate_results.py results/results_0801_1556_adaptive --names cluster
+```
+
+It catches the measurement bugs that code review does not: two tiers pinging the same batch (cluster `done` sums past `SYSTEM`), a tier that stopped reporting early (line-count mismatch between `batch_done_ns.log` and `fps_cluster_ns.log`), overlapping busy intervals (utilization above 100%), and percentiles computed on pre-averaged data (`p50 > p95`).
 
 ---
 

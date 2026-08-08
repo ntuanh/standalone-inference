@@ -14,7 +14,8 @@ import pika.exceptions
 from src.Compress import Encoder,Decoder
 import src.Log as Log
 from src.Model import inference, postprocess_yolo
-from src.Utils import get_intermediate_queue_args, get_bbox_queue_args, get_publish_slots
+from src.Utils import (get_intermediate_queue_args, get_bbox_queue_args,
+                       get_publish_slots, get_slot_queue_args)
 
 # Raw-frame batches (~150 MB/msg in only_cloud and on adaptive's split route)
 # are bounded by the slot_queue permit pool, sized from rabbit.max-queue-messages
@@ -68,7 +69,8 @@ class Scheduler:
         # Publish permits for raw-frame batches (server pre-fills the pool).
         # Edge takes one before transmitting, cloud returns one after fetching.
         self.slot_queue = "slot_queue"
-        self.channel.queue_declare(self.slot_queue, durable=False)
+        self.channel.queue_declare(self.slot_queue, durable=False,
+                                   arguments=get_slot_queue_args())
         self._publish_slots = get_publish_slots()
         self._my_metrics_queue = None  # set by _setup_metrics_fanout_queue
 
@@ -170,7 +172,8 @@ class Scheduler:
                 self.channel.queue_declare(self.fps_queue, durable=False)
                 self.channel.queue_declare(self.utilization_queue, durable=False)
                 self.channel.queue_declare(self.events_queue, durable=False)
-                self.channel.queue_declare(self.slot_queue, durable=False)
+                self.channel.queue_declare(self.slot_queue, durable=False,
+                                   arguments=get_slot_queue_args())
                 if self._confirms_enabled:
                     self._confirms_enabled = False
                     self._enable_publisher_confirms()

@@ -29,18 +29,20 @@ rabbit:
   # Set a cap to 0 / remove to disable that queue's limit.
   #
   # intermediate_queue: heavy, carries raw image batches (~150 MB each at
-  #   batch-size 32). This value does double duty — it is BOTH the queue's
-  #   x-max-length AND the size of the slot_queue permit pool that every edge
-  #   must draw from before it transmits a raw-frame batch. The permit is what
-  #   actually bounds broker RAM: x-max-length is only evaluated once the broker
-  #   has received a message in full, so without permits all 9 edges can each
-  #   push a complete 150 MB body before any one of them is rejected.
+  #   batch-size 32). This value does triple duty — it is the queue's
+  #   x-max-length, the size of the slot_queue permit pool every edge must draw
+  #   from before transmitting a raw-frame batch, AND slot_queue's own cap so
+  #   that pool can never over-fill. The permit is what actually bounds broker
+  #   RAM: x-max-length is evaluated only after the broker has received a body
+  #   in full, so without permits all 9 edges can each push a complete 150 MB
+  #   message before any one of them is rejected (~1.3 GB).
   #
-  #   Peak broker RAM ≈ max-queue-messages × per-message size.
-  #     4 × 150 MB = 600 MB   (+ ~150-300 MB RabbitMQ base & management plugin)
-  #   Raising this raises the ceiling linearly — keep it under 5 on a host with
-  #   less than 2 GB of headroom.
-  max-queue-messages: 4
+  #   Peak broker RAM ≈ max-queue-messages × per-message size:
+  #     1 -> 150 MB     2 -> 300 MB     3 -> 450 MB     4 -> 600 MB
+  #   plus ~150-300 MB for the RabbitMQ base and the management plugin. This is
+  #   NOT the last line of defence — set vm_memory_high_watermark.absolute on
+  #   the broker too, since that holds even when a client misbehaves.
+  max-queue-messages: 2
   # bbox_queue: light, carries edge-computed bboxes (~KB text). Cap can be deep.
   #   If unset, falls back to max-queue-messages.
   bbox-max-queue-messages: 20

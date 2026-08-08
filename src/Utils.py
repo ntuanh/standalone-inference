@@ -53,6 +53,27 @@ def get_bbox_queue_args(config=None):
     return _overflow_args(max_len, rabbit.get('overflow', 'reject-publish'))
 
 
+def get_slot_queue_args(config=None):
+    """Args for slot_queue — the raw-frame publish permit pool.
+
+    The cap is the whole point: it makes the pool physically incapable of
+    holding more permits than the configured limit, so broker RAM stays bounded
+    even when permit accounting goes wrong. It can go wrong easily — the cloud
+    mints a permit for every raw-frame batch it pulls, so ANY message that was
+    not paid for (a leftover from a previous run, a batch from an edge still
+    running older code during a rolling restart) inflates the pool. An inflated
+    pool hands out permits instantly, every edge routes to the cloud, and all 9
+    push ~150 MB at once. Without this cap that failure is unbounded.
+
+    'drop-head' rather than 'reject-publish': permits are fungible, so when the
+    pool is full the right thing is to quietly discard the surplus one.
+    """
+    max_len = get_publish_slots(config)
+    if not max_len:
+        return None
+    return {'x-max-length': int(max_len), 'x-overflow': 'drop-head'}
+
+
 def get_publish_slots(config=None):
     """How many raw-frame batches may be in the broker at once.
 
@@ -84,8 +105,11 @@ def delete_old_queues(address, username, password, virtual_host):
 
         for queue in queues:
             queue_name = queue['name']
+            # slot_queue is DELETED, not purged: its x-max-length must be able to
+            # change with rabbit.max-queue-messages, and re-declaring a queue with
+            # different arguments is a PRECONDITION_FAILED that closes the channel.
             if queue_name.startswith("reply") or queue_name.startswith("intermediate_queue") or queue_name.startswith(
-                    "result") or queue_name.startswith("rpc_queue") or queue_name.startswith("bbox_queue") or queue_name.startswith("mfq"):
+                    "result") or queue_name.startswith("rpc_queue") or queue_name.startswith("bbox_queue") or queue_name.startswith("mfq") or queue_name.startswith("slot_queue"):
 
                 http_channel.queue_delete(queue=queue_name)
 

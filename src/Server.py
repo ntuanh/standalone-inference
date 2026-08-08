@@ -9,7 +9,8 @@ import pickle
 import src.Model
 import src.Log
 import src.Results
-from src.Utils import get_intermediate_queue_args, get_bbox_queue_args, get_publish_slots
+from src.Utils import (get_intermediate_queue_args, get_bbox_queue_args,
+                       get_publish_slots, get_slot_queue_args)
 from ultralytics import YOLO
 
 from src.Clustering import (
@@ -85,8 +86,15 @@ class Server:
         # starts transmitting and the cloud returns one as soon as it pulls a
         # batch off intermediate_queue, so the number of ~150 MB bodies the
         # broker holds at once is bounded by the token count rather than by the
-        # edge count. See get_publish_slots() for why x-max-length can't do this.
-        self.channel.queue_declare(queue='slot_queue', durable=False)
+        # edge count — intermediate_queue's own x-max-length cannot do that,
+        # because it is evaluated only after the body has been received in full.
+        #
+        # The queue is itself length-capped (get_slot_queue_args): a permit pool
+        # that can over-fill provides no protection at all, since it then hands
+        # out permits to every edge at once. That cap is the actual guarantee;
+        # the accounting below is just the common case.
+        self.channel.queue_declare(queue='slot_queue', durable=False,
+                                   arguments=get_slot_queue_args(config))
         self.channel.queue_purge(queue='slot_queue')
         self.publish_slots = get_publish_slots(config)
         for _ in range(self.publish_slots):

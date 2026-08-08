@@ -14,14 +14,15 @@ import pika.exceptions
 from src.Compress import Encoder,Decoder
 import src.Log as Log
 from src.Model import inference, postprocess_yolo
-from src.Utils import get_intermediate_queue_args, get_bbox_queue_args
+from src.Utils import get_intermediate_queue_args, get_bbox_queue_args, get_publish_slots
 
-# Fixed cap on intermediate_queue depth (messages) before an edge waits.
-# Only only_cloud sends large raw frames (~150MB/msg), which can blow up
-# RabbitMQ broker memory on the Hub if too many pile up. split/Hungarian
-# sends small compressed feature maps and has never overflowed, so it's
-# left unconstrained.
-MAX_QUEUE_ONLY_CLOUD = 15
+# Raw-frame batches (~150 MB/msg in only_cloud and on adaptive's split route)
+# are bounded by the slot_queue permit pool, sized from rabbit.max-queue-messages
+# — see Utils.get_publish_slots and Scheduler._acquire_slot. The depth-poll this
+# replaced could not bound broker memory: a message is invisible to the queue's
+# message_count until the broker has received all of it, so every edge polling
+# during a multi-second upload read an empty queue and transmitted anyway.
+
 
 class Scheduler:
     def __init__(self, client_id, layer_id, channel, device):
@@ -64,6 +65,11 @@ class Scheduler:
         # time-axis chart.
         self.events_queue = "events_queue"
         self.channel.queue_declare(self.events_queue, durable=False)
+        # Publish permits for raw-frame batches (server pre-fills the pool).
+        # Edge takes one before transmitting, cloud returns one after fetching.
+        self.slot_queue = "slot_queue"
+        self.channel.queue_declare(self.slot_queue, durable=False)
+        self._publish_slots = get_publish_slots()
         self._my_metrics_queue = None  # set by _setup_metrics_fanout_queue
 
         # Raw per-unit latency samples, shipped as arrays with this device's
@@ -164,6 +170,7 @@ class Scheduler:
                 self.channel.queue_declare(self.fps_queue, durable=False)
                 self.channel.queue_declare(self.utilization_queue, durable=False)
                 self.channel.queue_declare(self.events_queue, durable=False)
+                self.channel.queue_declare(self.slot_queue, durable=False)
                 if self._confirms_enabled:
                     self._confirms_enabled = False
                     self._enable_publisher_confirms()
@@ -173,19 +180,49 @@ class Scheduler:
                 Log.print_with_color(f"[Reconnect] Retry in 1s ({e})", "yellow")
                 time.sleep(1.0)
 
-    def _check_backpressure(self):
-        max_queue = MAX_QUEUE_ONLY_CLOUD
-        depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
-        if depth < max_queue:
-            return
+    def _acquire_slot(self, timeout_s=None):
+        """Take one raw-frame publish permit; True once this device holds one.
 
-        Log.print_with_color(
-            f"[BackPressure] '{self.intermediate_queue}' depth={depth} >= max_queue={max_queue}, waiting", "yellow")
-        while depth >= max_queue:
-            time.sleep(0.1)
-            depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
-        Log.print_with_color(
-            f"[BackPressure] '{self.intermediate_queue}' depth={depth} < max_queue={max_queue}, resuming", "green")
+        The permit — not the depth probe — is what reserves room for a ~150 MB
+        body. A depth check is stale for the whole upload, because the message
+        does not count towards the queue until the broker has received all of
+        it, so every edge that checks during that window sees an empty queue
+        and starts transmitting too.
+
+        timeout_s=None blocks until a permit frees up (only_cloud has nowhere
+        else to send the batch); 0.0 tries once and gives up, which lets
+        adaptive fall straight through to running the batch locally.
+        """
+        if not self._publish_slots:
+            return True
+        deadline = None if timeout_s is None else time.time() + timeout_s
+        while True:
+            try:
+                method_frame, _, _ = self.channel.basic_get(
+                    queue=self.slot_queue, auto_ack=True)
+                if method_frame:
+                    return True
+            except self._CONN_ERRORS:
+                self._reconnect()
+                continue
+            if deadline is not None and time.time() >= deadline:
+                return False
+            try:
+                self.channel.connection.sleep(0.02)
+            except Exception:
+                time.sleep(0.02)
+
+    def _release_slot(self):
+        """Return a permit to the pool. Called by the cloud the moment it pulls
+        a raw-frame batch off intermediate_queue — that is when the body stops
+        occupying broker memory, so that is when the next edge may transmit."""
+        if not self._publish_slots:
+            return
+        try:
+            self.channel.basic_publish(
+                exchange='', routing_key=self.slot_queue, body=b'1')
+        except Exception as e:
+            Log.print_with_color(f"[Slots] release failed: {e}", "yellow")
 
     def _enable_publisher_confirms(self):
         """Turn the edge publish channel into confirm mode so the broker tells us
@@ -208,9 +245,10 @@ class Scheduler:
         reject-publish', a publish that would exceed 'x-max-length' is NACKed by
         the broker (pika raises NackError) and the message is NOT enqueued. We
         treat that as back-pressure: wait for the cloud to drain, then retry —
-        so the frame is never lost. Mirrors the depth-poll _check_backpressure,
-        but uses the broker as the source of truth and works in every mode
-        (split / only_edge / only_cloud), not just only_cloud."""
+        so the frame is never lost. This is the last-resort net: raw-frame
+        publishes hold a permit (_acquire_slot) that already reserves a queue
+        slot, so a NACK here should only ever be seen by the smaller payloads
+        (split feature maps, only_edge / adaptive bboxes)."""
         while True:
             try:
                 self.channel.basic_publish(exchange='', routing_key=queue_name, body=body)
@@ -580,10 +618,13 @@ class Scheduler:
                         "edge_start_time": edge_start_wall
                     }
 
+                    # Block until a permit is free — only_cloud has no local
+                    # fallback, so waiting here IS the back-pressure. Nothing
+                    # goes on the wire until the broker has room for it.
                     _wait_start = time.perf_counter()
                     with open(self._timing_log_edge, "a") as _tf:
                         print(str(time.time_ns()) + " queue_wait_start", file=_tf)
-                    self._check_backpressure()
+                    self._acquire_slot()
                     with open(self._timing_log_edge, "a") as _tf:
                         print(str(time.time_ns()) + " queue_wait_end", file=_tf)
                     queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
@@ -630,11 +671,20 @@ class Scheduler:
 
                 # ===== ADAPTIVE (full cloud  OR  full edge, decided per batch) =====
                 elif mode == "adaptive":
-                    depth = self._get_queue_depth(self.intermediate_queue)
+                    # Grabbing a permit IS the routing decision: a permit means the
+                    # broker has room for this batch, so offload it; no permit means
+                    # the cloud tier is saturated, so run it locally. Non-blocking
+                    # (timeout 0) — a batch is never delayed waiting for the cloud.
+                    #
+                    # This replaces the old `depth == 0` probe, which could not bound
+                    # anything: a message is invisible to the depth count until the
+                    # broker has received all of it, so every edge checking during a
+                    # multi-second upload saw an empty queue and piled on.
+                    #
                     # Decide, report the flip, then act — so the server's arrival
                     # timestamp marks when the controller changed its mind rather
                     # than when the resulting batch happened to finish.
-                    route_path = "split" if depth == 0 else "edge_only"
+                    route_path = "split" if self._acquire_slot(timeout_s=0.0) else "edge_only"
                     self._note_route(route_path)
                     if route_path == "split":
                         # --- Cloud has capacity → offload raw frames (full cloud YOLO) ---
@@ -645,10 +695,8 @@ class Scheduler:
                             "height": height,
                             "edge_start_time": edge_start_wall,
                         }
-                        _wait_start = time.perf_counter()
-                        self._check_backpressure()
-                        queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
-
+                        # Permit already held (that is what chose this route), so
+                        # the queue is guaranteed to have room — no wait needed.
                         _send_start = time.perf_counter()
                         self.send_next_layer(self.intermediate_queue, y, {"enable": False})
                         send_ms = (time.perf_counter() - _send_start) * 1000
@@ -854,6 +902,13 @@ class Scheduler:
                 self._reconnect()
                 continue
             if method_frame and body:
+                # Hand the permit back FIRST: the body is off the queue now, so it
+                # no longer costs broker memory and the next edge may transmit.
+                # Releasing after inference instead would idle the uplink for the
+                # whole (seconds-long) forward pass. Only raw-frame batches consume
+                # a permit — adaptive bbox messages and only_edge results do not.
+                if src_queue == "intermediate" and mode in ("only_cloud", "adaptive"):
+                    self._release_slot()
                 t_batch_ready = time.perf_counter()
                 gap_ms = (t_batch_ready - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
                 # One reading, used for both the timing log and the 'service'

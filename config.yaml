@@ -8,9 +8,10 @@ server:
   batch-size: 32
 experiment:
   enable: True   #False
-  # adaptive: per-batch routing — intermediate_queue empty → full cloud YOLO
-  #           (path 'split'); else → full edge YOLO, bboxes via bbox_queue
-  #           (path 'edge_only'). No model split.
+  # adaptive: per-batch routing — a free slot_queue permit → full cloud YOLO
+  #           (path 'split'); no permit → full edge YOLO, bboxes via bbox_queue
+  #           (path 'edge_only'). No model split. Permit count comes from
+  #           rabbit.max-queue-messages.
   mode: adaptive
   #mode: only_cloud
   #mode: only_edge
@@ -27,9 +28,19 @@ rabbit:
   # waits for the cloud to drain and retries — no message lost, broker RAM bounded.
   # Set a cap to 0 / remove to disable that queue's limit.
   #
-  # intermediate_queue: heavy, carries raw image batches (~MB each). Cap small.
-  #   broker RAM for this queue ≈ max-queue-messages × per-message size.
-  max-queue-messages: 1
+  # intermediate_queue: heavy, carries raw image batches (~150 MB each at
+  #   batch-size 32). This value does double duty — it is BOTH the queue's
+  #   x-max-length AND the size of the slot_queue permit pool that every edge
+  #   must draw from before it transmits a raw-frame batch. The permit is what
+  #   actually bounds broker RAM: x-max-length is only evaluated once the broker
+  #   has received a message in full, so without permits all 9 edges can each
+  #   push a complete 150 MB body before any one of them is rejected.
+  #
+  #   Peak broker RAM ≈ max-queue-messages × per-message size.
+  #     4 × 150 MB = 600 MB   (+ ~150-300 MB RabbitMQ base & management plugin)
+  #   Raising this raises the ceiling linearly — keep it under 5 on a host with
+  #   less than 2 GB of headroom.
+  max-queue-messages: 4
   # bbox_queue: light, carries edge-computed bboxes (~KB text). Cap can be deep.
   #   If unset, falls back to max-queue-messages.
   bbox-max-queue-messages: 20
@@ -43,7 +54,7 @@ fps:                      # optional; defaults shown
   grace_s: 10             # keep collecting DONEs this long after the work queues drain
   shutdown_timeout_s: 300 # hard cap so a dead worker can't hang the server
 compress:
-  enable: True
+  enable: False
   num_bit: 8
 
 clustering:

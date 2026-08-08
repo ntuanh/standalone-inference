@@ -174,7 +174,7 @@ cython_debug/
 .pypirc
 
 # Machine-specific config (each machine has its own)
-config.yaml
+# config.yaml
 
 # Runtime files
 metrics_raw_*.csv
@@ -182,3 +182,8 @@ metrics_pivoted.csv
 metrics_pivot.lock
 *.npy
 app.log
+
+# Archived run results (guide/05-archiving.md). Ignored as a whole directory:
+# '*.log' above already excludes the seven result files, so tracking the
+# config.yaml copied beside them would commit a run description with no numbers.
+results/

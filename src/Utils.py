@@ -53,6 +53,24 @@ def get_bbox_queue_args(config=None):
     return _overflow_args(max_len, rabbit.get('overflow', 'reject-publish'))
 
 
+def get_publish_slots(config=None):
+    """How many raw-frame batches may be in the broker at once.
+
+    Equal to the intermediate_queue cap, deliberately: an edge takes one permit
+    from slot_queue BEFORE it transmits, so holding a permit guarantees a free
+    slot in the queue and the publish cannot be NACKed. That matters because a
+    NACK costs a full retransmission of the body (~150 MB for raw frames).
+
+    'x-max-length' alone cannot bound broker memory here — the broker must
+    receive a message in full before it can evaluate the limit and reject it,
+    so N edges can each push a complete body before any one is refused. The
+    permit is taken up front, so N is bounded by the permit count instead of
+    by the edge count. Returns 0 when no cap is configured (permits disabled).
+    """
+    rabbit = _load_config(config).get('rabbit', {}) or {}
+    return int(rabbit.get('max-queue-messages') or 0)
+
+
 def delete_old_queues(address, username, password, virtual_host):
     url = f'http://{address}:15672/api/queues/{quote(virtual_host, safe="")}'
     response = requests.get(url, auth=HTTPBasicAuth(username, password))

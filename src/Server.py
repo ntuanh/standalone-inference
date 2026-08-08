@@ -9,7 +9,7 @@ import pickle
 import src.Model
 import src.Log
 import src.Results
-from src.Utils import get_intermediate_queue_args, get_bbox_queue_args
+from src.Utils import get_intermediate_queue_args, get_bbox_queue_args, get_publish_slots
 from ultralytics import YOLO
 
 from src.Clustering import (
@@ -79,6 +79,18 @@ class Server:
         self.channel.queue_declare(queue='bbox_queue', durable=False,
                                    arguments=get_bbox_queue_args(config))
         self.channel.queue_purge(queue='bbox_queue')
+
+        # slot_queue: publish permits for raw-frame batches, pre-filled with one
+        # token per allowed in-flight batch. An edge must hold a token before it
+        # starts transmitting and the cloud returns one as soon as it pulls a
+        # batch off intermediate_queue, so the number of ~150 MB bodies the
+        # broker holds at once is bounded by the token count rather than by the
+        # edge count. See get_publish_slots() for why x-max-length can't do this.
+        self.channel.queue_declare(queue='slot_queue', durable=False)
+        self.channel.queue_purge(queue='slot_queue')
+        self.publish_slots = get_publish_slots(config)
+        for _ in range(self.publish_slots):
+            self.channel.basic_publish(exchange='', routing_key='slot_queue', body=b'1')
 
         # fps_queue: every cloud publishes one tiny "done" ping per completed
         # batch; the server consumes them (on_fps_done) and computes FPS live.
@@ -165,6 +177,13 @@ class Server:
         self.batch_log_path = self.result_files["batch"]
         self.utilization_log_path = self.result_files["util"]
         self.logger = src.Log.Logger(f"{log_path}/app.log", config["debug-mode"])
+        if self.publish_slots:
+            src.Log.print_with_color(
+                f"[Slots] {self.publish_slots} raw-frame publish permits "
+                f"-> at most {self.publish_slots} batches in the broker at once", "cyan")
+        else:
+            src.Log.print_with_color(
+                "[Slots] disabled (no rabbit.max-queue-messages) — broker memory is unbounded", "yellow")
         self.logger.log_info(f"Application start. Server is waiting for {self.total_clients} clients.")
         src.Log.print_with_color(f"Application start. Server is waiting for {self.total_clients} clients.", "green")
 

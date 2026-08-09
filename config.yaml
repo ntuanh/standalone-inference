@@ -71,7 +71,7 @@ rabbit:
   #
   # This is NOT the last line of defence — set vm_memory_high_watermark.absolute
   # on the broker too, since that holds even when a client misbehaves.
-  max-queue-messages: 0.5
+  max-queue-messages: 1
   #
   # Overflow policy for a queue that hits its cap: the broker rejects further
   # publishes and NACKs the edge, which waits for the cloud to drain and retries

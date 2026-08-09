@@ -23,44 +23,51 @@ rabbit:
   username: "machine-1"
   password: "123456"
   virtual-host: /
-  # ---- Broker RAM budget -------------------------------------------------
-  # The knob is RAM, not a message count. src/Utils.raw_frame_transport_plan
-  # turns these two numbers into how many raw-frame batches may be resident in
-  # the broker at once (N), and N is used three ways: intermediate_queue's
-  # x-max-length, the size of the slot_queue permit pool an edge must draw from
-  # before it transmits, and slot_queue's own cap so the pool cannot over-fill.
+  # ---- a: max messages resident in one cloud's work queue -----------------
+  # Measured in WHOLE raw-frame batch messages, and it may be fractional.
+  # src/Utils.transport_plan turns it into the queue geometry:
   #
-  # The permit is what actually bounds RAM. x-max-length is evaluated only after
-  # the broker has received a body in full, so without permits all 9 edges can
-  # each push a complete 150 MiB message before any one is rejected (~1.3 GB).
-  # A permit is taken BEFORE transmitting, so peak resident bodies is N, never 9.
+  #   a = 2     2 full batch messages resident      2 x 150 = 300 MiB per queue
+  #   a = 1     1 full batch message                      150 MiB per queue
+  #   a = 0.5   batch cut into 2 chunks, 1 resident        75 MiB per queue
+  #   a = 0.25  batch cut into 4 chunks, 1 resident        37 MiB per queue
   #
-  #   body       = batch-size x 640x640x3 float32          (32 -> 150 MiB)
-  #   accounted  = body x 1.2   (broker frame-assembly + per-message overhead)
-  #   N          = (budget - reserve) / accounted          (32 -> 4)
-  #   peak host  = N x accounted + reserve                 (32 -> 1020 MiB)
+  # a >= 1 keeps one message per batch and caps the queue at floor(a). a < 1
+  # cannot be expressed as a message count, so the MESSAGE is made smaller
+  # instead: the batch is cut into ceil(1/a) chunks and the queue holds one.
+  # ceil rounds the resident payload down, never up (a = 0.6 -> 2 chunks -> 0.5
+  # batches), so a is a bound that is undershot, not exceeded.
   #
-  # At batch-size 32: 4 permits, peak ~720 MiB of bodies + 300 MiB reserve, so
-  # the host stays under the 1024 MB budget. The server prints the arithmetic it
-  # computed as a [Slots] line at startup — check it there, not here.
+  # Chunks are labelled in the AMQP headers (batch_key, chunk_index, chunk_total)
+  # and merged by the cloud BEFORE inference, so a batch is still one unit of
+  # work however many messages carried it — latency, e2e, FPS and mAP accounting
+  # do not change with a.
   #
-  # These keys and server.batch-size MUST be identical in every machine's
-  # config.yaml: N becomes a queue argument, and a queue_declare with different
-  # arguments is a PRECONDITION_FAILED that kills the channel.
+  # a is per QUEUE, and each cloud has its own work queue (the merge needs every
+  # chunk of a batch to reach the same consumer), so the broker holds up to
+  #   clients[1] x a x batch_body     = 3 x 0.5 x 150 MiB = 225 MiB at a = 0.5.
+  # The server prints the arithmetic it computed as a [Slots] line at startup —
+  # read it there, not here.
+  #
+  # a is also the size of each queue's slot_queue permit pool. The permit, not
+  # x-max-length, is what actually bounds RAM: x-max-length is evaluated only
+  # after the broker has received a body in full, so without permits all 9 edges
+  # can each push a complete message before any one is rejected. The permit is
+  # taken BEFORE transmitting.
+  #
+  # a and server.batch-size MUST be identical in every machine's config.yaml:
+  # both feed queue arguments, and a queue_declare with different arguments is a
+  # PRECONDITION_FAILED that kills the channel.
   #
   # This is NOT the last line of defence — set vm_memory_high_watermark.absolute
   # on the broker too, since that holds even when a client misbehaves.
-  broker-ram-budget-mb: 1024   # ceiling for the whole broker host
-  broker-ram-reserve-mb: 300   # RabbitMQ base + management plugin, before payload
-  # Optional manual ceiling on N. Can only LOWER what the budget allows, so it
-  # is not a way to opt out of the budget. Leave unset to use the full budget.
-  # max-queue-messages: 2
+  max-queue-messages: 0.5
   #
   # Overflow policy for a queue that hits its cap: the broker rejects further
   # publishes and NACKs the edge, which waits for the cloud to drain and retries
   # — no message lost.
   # bbox_queue: light, carries edge-computed bboxes (~KB text), so its cap can be
-  #   far deeper than the image queue's for the same RAM. Falls back to N if unset.
+  #   far deeper than the image queue's for the same RAM. Falls back to a if unset.
   bbox-max-queue-messages: 20
   overflow: reject-publish
 

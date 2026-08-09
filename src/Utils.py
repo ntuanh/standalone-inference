@@ -1,3 +1,4 @@
+import math
 import pika
 from requests.auth import HTTPBasicAuth
 from urllib.parse import quote
@@ -13,25 +14,36 @@ _MB = 1024 * 1024
 # float32. Scheduler.first_layer resizes every frame to 640x640, scales it to
 # float32, then clones one contiguous tensor per frame into the message, so a
 # raw-frame batch body is batch_size x this, give or take a few hundred bytes
-# of pickle framing.
+# of pickle framing. Used only to report sizes in the startup banner.
 FRAME_BYTES = 640 * 640 * 3 * 4          # 4,915,200 B = 4.6875 MiB
-
-# A resident message costs the broker more than its body: the frame assembler
-# holds part of the payload a second time while the body is still arriving, and
-# there is per-message and queue-index overhead on top. The permit pool is
-# sized against an inflated body so those transients cannot push the host past
-# the budget.
-BODY_OVERHEAD_FACTOR = 1.2
-
-# Defaults for rabbit.broker-ram-budget-mb / broker-ram-reserve-mb. The reserve
-# is what RabbitMQ costs before it holds any of our payload (Erlang VM +
-# management plugin); measure it on your broker with the queues empty and set
-# the key if it differs.
-DEFAULT_RAM_BUDGET_MB = 1024
-DEFAULT_RAM_RESERVE_MB = 300
 
 # Broker-side mutex proving one server owns the run — see acquire_server_lock.
 SERVER_LOCK_QUEUE = "server_lock"
+
+
+def cloud_work_queue(base, index):
+    """The dedicated raw-frame work queue for one cloud.
+
+    Each cloud consumes ONLY its own queue. That is what makes chunking work:
+    with a shared queue the 3 clouds compete, so chunk 1 of a batch goes to one
+    cloud and chunk 2 to another and neither can merge them. Giving each cloud
+    its own queue means every chunk an edge sends for a batch lands on the same
+    consumer by construction, with no claim handshake.
+
+    `base` stays the CLUSTER identity (intermediate_queue, or
+    intermediate_queue_k under clustering) and is what the FPS pings, metrics
+    filenames, fanout exchange and utilization reports are keyed on — the
+    per-cloud suffix must never leak into those, or one cluster's results
+    fragment into three.
+    """
+    return f"{base}_c{int(index)}"
+
+
+def slot_queue_for(work_queue):
+    """Permit pool guarding one cloud work queue. Named with the 'slot_queue'
+    prefix so delete_old_queues still deletes it (its arguments change with
+    `a`, and re-declaring with different arguments is a PRECONDITION_FAILED)."""
+    return f"slot_queue_{work_queue}"
 
 
 def _load_config(config):
@@ -44,107 +56,94 @@ def _load_config(config):
     return config
 
 
-def raw_frame_transport_plan(config=None):
-    """How many raw-frame batches may be resident in the broker at once, derived
-    from a RAM budget instead of a hand-picked message count.
+def transport_plan(config=None):
+    """Turn `a` (rabbit.max-queue-messages) into the queue geometry.
 
-    `rabbit.broker-ram-budget-mb` is the ceiling for the whole broker host, and
-    `broker-ram-reserve-mb` is what the RabbitMQ runtime itself occupies, so
-    only the difference is available for message bodies. The permit pool is then
-    sized to keep
+    `a` is the cap on ONE cloud work queue, measured in whole raw-frame batch
+    messages, and it may be fractional:
 
-        permits x body_bytes x BODY_OVERHEAD_FACTOR  <=  available
+        a = 2     2 full batch messages resident per cloud queue
+        a = 1     1 full batch message
+        a = 0.5   half a batch: the batch is cut into 2 chunks, 1 resident
+        a = 0.25  a quarter:    4 chunks, 1 resident
 
-    which is an invariant, not an estimate: an edge takes a permit BEFORE it
-    starts transmitting, so at most `permits` bodies can ever be in flight (see
-    get_publish_slots for why x-max-length alone cannot bound this).
+    a >= 1 keeps one message per batch and caps the queue at floor(a). a < 1
+    cannot be expressed as a message count at all, so the MESSAGE is made
+    smaller instead: a chunk carries floor(a x batch_size) frames and the queue
+    holds one of them, which takes ceil(batch_size / that) chunks to move a
+    batch. Flooring the frames per chunk keeps the resident payload at or below
+    `a`, so the bound is undershot, never exceeded — with one exception: a frame
+    is indivisible, so for a < 1/batch_size the chunk stays at one frame and the
+    resident payload stops shrinking. The banner prints the payload it actually
+    settled on.
 
-    Pure calculation — it never raises. `permits` is 0 when the budget is
-    switched off (budget 0 and no manual cap, i.e. unbounded broker memory) and
-    -1 when a single batch cannot fit the budget at all; the caller decides
-    whether that is fatal (validate_transport_config).
+    Chunks are labelled in the AMQP headers (batch_key / chunk_index /
+    chunk_total) and merged by the cloud before inference, so a batch stays one
+    unit of work no matter how many messages carried it: latency, e2e, FPS and
+    mAP accounting are all untouched by `a`.
 
-    Every machine must compute the SAME number, because it becomes
-    intermediate_queue's x-max-length and a mismatched queue_declare is a
-    PRECONDITION_FAILED. It is derived from server.batch-size and the rabbit
-    budget keys, so those three must be identical in every config.yaml.
+    Pure calculation — never raises. `capacity` is 0 when `a` is unset, which
+    means no cap and no permits, i.e. unbounded broker memory.
+
+    Every machine must compute the SAME numbers: `capacity` becomes the queue's
+    x-max-length and a mismatched queue_declare is a PRECONDITION_FAILED. So
+    `a` and server.batch-size must be identical in every config.yaml.
     """
     config = _load_config(config)
     rabbit = config.get('rabbit', {}) or {}
-    batch_size = int((config.get('server') or {}).get('batch-size') or 0)
-    budget_mb = float(rabbit.get('broker-ram-budget-mb', DEFAULT_RAM_BUDGET_MB) or 0)
-    reserve_mb = float(rabbit.get('broker-ram-reserve-mb', DEFAULT_RAM_RESERVE_MB) or 0)
-    available = max(0.0, budget_mb - reserve_mb) * _MB
-    body = batch_size * FRAME_BYTES
-    cost = body * BODY_OVERHEAD_FACTOR
-    # max-queue-messages is kept as a manual override, and it can only ever
-    # LOWER the derived count — otherwise it would be a way to opt out of the
-    # RAM budget by editing an unrelated-looking key.
-    override = int(rabbit.get('max-queue-messages') or 0)
+    server = config.get('server') or {}
+    batch_size = int(server.get('batch-size') or 0)
+    clients = server.get('clients') or []
+    num_clouds = int(clients[-1]) if len(clients) > 1 else 1
+    a = float(rabbit.get('max-queue-messages') or 0)
 
-    if budget_mb <= 0 or batch_size <= 0:
-        permits = override
-    elif cost > available:
-        permits = -1
+    if a <= 0 or batch_size <= 0:
+        capacity, frames_per_chunk = 0, batch_size
+    elif a >= 1:
+        capacity, frames_per_chunk = int(a), batch_size
     else:
-        permits = int(available // cost)
-        if override:
-            permits = min(permits, override)
+        # Size the CHUNK from `a` (floor), then count how many it takes — not the
+        # other way round. Deriving frames_per_chunk as ceil(batch/chunks) rounds
+        # the payload UP and can overshoot: a=0.1 of 32 frames wants 3.2 frames,
+        # and ceil(32/10)=4 frames is 25% over the bound. One frame is the floor;
+        # below that (a < 1/batch_size) the chunk cannot shrink further and the
+        # resident payload is one frame regardless of `a`.
+        capacity = 1
+        frames_per_chunk = max(1, int(math.floor(a * batch_size)))
 
+    chunks = int(math.ceil(batch_size / frames_per_chunk)) if frames_per_chunk else 1
+    chunk_bytes = frames_per_chunk * FRAME_BYTES
     return {
+        "a": a,
         "batch_size": batch_size,
-        "body_bytes": body,
-        "body_cost_bytes": cost,
-        "available_bytes": available,
-        "budget_mb": budget_mb,
-        "reserve_mb": reserve_mb,
-        "permits": permits,
-        "peak_bytes": max(permits, 0) * cost,
-        "max_batch_size": int(available // (FRAME_BYTES * BODY_OVERHEAD_FACTOR)),
-        "override": override,
+        "num_clouds": num_clouds,
+        "chunks": chunks,                        # messages per batch
+        "frames_per_chunk": frames_per_chunk,
+        "capacity": capacity,                    # x-max-length AND permits per pool
+        "body_bytes": batch_size * FRAME_BYTES,  # one whole batch
+        "chunk_bytes": chunk_bytes,              # one message
+        "peak_per_queue_bytes": capacity * chunk_bytes,
+        "peak_total_bytes": capacity * chunk_bytes * num_clouds,
     }
 
 
-def transport_config_error(plan):
-    """The reason `plan` is unusable, or None when it is fine."""
-    if plan["permits"] != -1:
-        return None
-    return (
-        f"server.batch-size {plan['batch_size']} makes one raw-frame message "
-        f"{plan['body_bytes'] / _MB:.0f} MiB (~{plan['body_cost_bytes'] / _MB:.0f} MiB "
-        f"of broker RAM), but only {plan['available_bytes'] / _MB:.0f} MiB is "
-        f"available: {plan['budget_mb']:.0f} MB rabbit.broker-ram-budget-mb minus "
-        f"{plan['reserve_mb']:.0f} MB broker-ram-reserve-mb. The broker cannot hold "
-        f"even one batch inside the budget, so no permit count can keep it under. "
-        f"Lower server.batch-size to {plan['max_batch_size']} or less, or raise "
-        f"rabbit.broker-ram-budget-mb."
-    )
-
-
-def validate_transport_config(config=None):
-    """Return the plan, raising RuntimeError if it cannot honour the budget.
-    Call this at startup, before any queue is declared, so an impossible config
-    fails with one readable line instead of a traceback out of queue_declare."""
-    plan = raw_frame_transport_plan(config)
-    error = transport_config_error(plan)
-    if error:
-        raise RuntimeError(error)
-    return plan
-
-
 def describe_transport_plan(plan):
-    """One-line startup banner spelling out the RAM arithmetic, so a run's log
-    records the bound it was actually operating under."""
-    if plan["permits"] <= 0:
-        return ("[Slots] disabled — rabbit.broker-ram-budget-mb is 0 and no "
-                "max-queue-messages is set; broker memory is UNBOUNDED")
-    peak_mb = plan["peak_bytes"] / _MB
+    """Startup banner spelling out the geometry `a` produced, so a run's log
+    records the bound it actually operated under. Reports the whole-broker total
+    as well as the per-queue cap: `a` caps ONE cloud queue, and there is one
+    such queue per cloud, so the broker holds up to num_clouds x that."""
+    if plan["capacity"] <= 0:
+        return ("[Slots] disabled — rabbit.max-queue-messages is unset; queues are "
+                "uncapped, no publish permits, broker memory is UNBOUNDED")
+    split = (f"batch of {plan['batch_size']} split into {plan['chunks']} x "
+             f"{plan['frames_per_chunk']} frames"
+             if plan["chunks"] > 1 else
+             f"batch of {plan['batch_size']} in one message")
     return (
-        f"[Slots] {plan['permits']} raw-frame publish permits x "
-        f"{plan['body_bytes'] / _MB:.0f} MiB/batch (batch-size {plan['batch_size']}) "
-        f"-> peak {peak_mb:.0f} MiB of message bodies + {plan['reserve_mb']:.0f} MiB "
-        f"broker reserve = {peak_mb + plan['reserve_mb']:.0f} MiB of "
-        f"{plan['budget_mb']:.0f} MiB budget"
+        f"[Slots] a={plan['a']:g} -> {split}, {plan['capacity']} resident per cloud "
+        f"queue = {plan['peak_per_queue_bytes'] / _MB:.0f} MiB each; "
+        f"{plan['num_clouds']} cloud queues -> {plan['peak_total_bytes'] / _MB:.0f} MiB "
+        f"peak in the broker"
     )
 
 
@@ -167,12 +166,14 @@ def _overflow_args(max_len, overflow):
 
 
 def get_intermediate_queue_args(config=None):
-    """Overflow args for intermediate_queue / intermediate_queue_k — the heavy
-    queue carrying raw image batches (~MB each). Capped at the same N as the
-    permit pool (raw_frame_transport_plan), so a held permit always corresponds
-    to a free slot and a permitted publish can never be NACKed."""
+    """Overflow args for a raw-frame work queue — `capacity` messages, which is
+    also the size of that queue's permit pool, so a held permit always
+    corresponds to a free slot and a permitted publish can never be NACKed.
+
+    Also used for the shared base intermediate_queue, which in only_edge / split
+    mode carries whole (unchunked) messages."""
     rabbit = _load_config(config).get('rabbit', {}) or {}
-    return _overflow_args(get_publish_slots(config),
+    return _overflow_args(transport_plan(config)["capacity"],
                           rabbit.get('overflow', 'reject-publish'))
 
 
@@ -182,21 +183,21 @@ def get_bbox_queue_args(config=None):
     much deeper than the image queue for the same RAM. Falls back to the
     raw-frame permit count if the bbox-specific key is unset."""
     rabbit = _load_config(config).get('rabbit', {}) or {}
-    max_len = rabbit.get('bbox-max-queue-messages') or get_publish_slots(config)
+    max_len = rabbit.get('bbox-max-queue-messages') or transport_plan(config)["capacity"]
     return _overflow_args(max_len, rabbit.get('overflow', 'reject-publish'))
 
 
 def get_slot_queue_args(config=None):
-    """Args for slot_queue — the raw-frame publish permit pool.
+    """Args for a permit pool (one per cloud work queue, slot_queue_for()).
 
     The cap is the whole point: it makes the pool physically incapable of
-    holding more permits than the RAM budget allows, so broker RAM stays bounded
-    even when permit accounting goes wrong. It can go wrong easily — the cloud
-    mints a permit for every raw-frame batch it pulls, so ANY message that was
-    not paid for (a leftover from a previous run, a batch from an edge still
-    running older code during a rolling restart) inflates the pool. An inflated
-    pool hands out permits instantly, every edge routes to the cloud, and all 9
-    push ~150 MB at once. Without this cap that failure is unbounded.
+    holding more permits than `a` allows, so broker RAM stays bounded even when
+    permit accounting goes wrong. It can go wrong easily — the cloud mints a
+    permit for every chunk it pulls, so ANY message that was not paid for (a
+    leftover from a previous run, a batch from an edge still running older code
+    during a rolling restart) inflates the pool. An inflated pool hands out
+    permits instantly, every edge routes to the cloud, and all 9 push ~150 MB
+    at once. Without this cap that failure is unbounded.
 
     'drop-head' rather than 'reject-publish': permits are fungible, so when the
     pool is full the right thing is to quietly discard the surplus one.
@@ -208,25 +209,21 @@ def get_slot_queue_args(config=None):
 
 
 def get_publish_slots(config=None):
-    """How many raw-frame batches may be in the broker at once.
+    """Permits in ONE cloud queue's pool — how many chunks that cloud may have
+    resident at once. Equal to that queue's x-max-length deliberately: an edge
+    takes a permit from the pool BEFORE it transmits, so holding a permit
+    guarantees a free slot and the publish cannot be NACKed. That matters
+    because a NACK costs a full retransmission of the body.
 
-    Sized by raw_frame_transport_plan from the RAM budget, and equal to the
-    intermediate_queue cap deliberately: an edge takes one permit from
-    slot_queue BEFORE it transmits, so holding a permit guarantees a free slot
-    in the queue and the publish cannot be NACKed. That matters because a NACK
-    costs a full retransmission of the body (~150 MB for raw frames).
+    'x-max-length' alone cannot bound broker memory — the broker must receive a
+    message in full before it can evaluate the limit and reject it, so all 9
+    edges can each push a complete body before any one is refused. The permit is
+    taken up front, so the resident count is bounded by the permit count rather
+    than by the edge count.
 
-    'x-max-length' alone cannot bound broker memory here — the broker must
-    receive a message in full before it can evaluate the limit and reject it,
-    so N edges can each push a complete body before any one is refused. The
-    permit is taken up front, so N is bounded by the permit count instead of
-    by the edge count. Returns 0 only when the budget is switched off.
-
-    Raises rather than falling back to 0 when the budget is unsatisfiable: 0
-    means "unbounded", which is the opposite of what an over-budget config asks
-    for, and it would fail silently in exactly the case the budget exists for.
+    Returns 0 when `a` is unset, which means uncapped and unpermitted.
     """
-    return max(0, validate_transport_config(config)["permits"])
+    return transport_plan(config)["capacity"]
 
 
 def acquire_server_lock(address, username, password, virtual_host):
@@ -296,10 +293,10 @@ def delete_old_queues(address, username, password, virtual_host):
             # it is ours: we are only running because we hold it.
             if queue.get('exclusive') or queue_name == SERVER_LOCK_QUEUE:
                 continue
-            # slot_queue is DELETED, not purged: its x-max-length is derived from
-            # the RAM budget and batch-size (raw_frame_transport_plan), so it must
-            # be free to change between runs — re-declaring a queue with different
-            # arguments is a PRECONDITION_FAILED that closes the channel.
+            # The permit pools are DELETED, not purged: their x-max-length comes
+            # from `a` (transport_plan), so it must be free to change between runs
+            # — re-declaring a queue with different arguments is a
+            # PRECONDITION_FAILED that closes the channel.
             try:
                 if queue_name.startswith("reply") or queue_name.startswith("intermediate_queue") or queue_name.startswith(
                         "result") or queue_name.startswith("rpc_queue") or queue_name.startswith("bbox_queue") or queue_name.startswith("mfq") or queue_name.startswith("slot_queue"):

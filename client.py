@@ -1,5 +1,4 @@
 import os
-import sys
 import pika
 import uuid
 import argparse
@@ -10,7 +9,7 @@ import torch
 import src.Log
 from src.RpcClient import RpcClient
 from src.Scheduler import Scheduler
-from src.Utils import validate_transport_config, describe_transport_plan
+from src.Utils import transport_plan, describe_transport_plan
 
 parser = argparse.ArgumentParser(description="Split learning framework")
 parser.add_argument('--layer_id', type=int, required=True, help='ID of layer, start from 1')
@@ -60,16 +59,11 @@ connection = pika.BlockingConnection(
 channel = connection.channel()
 
 if __name__ == "__main__":
-    # The permit count is derived from the RAM budget and becomes a queue
-    # argument, so an impossible budget must fail here with one readable line
-    # rather than as a PRECONDITION_FAILED out of the first queue_declare. It
-    # must also match the server's number exactly — same batch-size, same
-    # rabbit budget keys in this machine's config.yaml.
-    try:
-        src.Log.print_with_color(describe_transport_plan(validate_transport_config(config)), "cyan")
-    except RuntimeError as e:
-        src.Log.print_with_color(f"[!] Broker RAM budget: {e}", "red")
-        sys.exit(1)
+    # Print the geometry `a` produced. It must match the server's exactly — same
+    # a, same batch-size in this machine's config.yaml — because it becomes a
+    # queue argument, and a queue_declare with different arguments is a
+    # PRECONDITION_FAILED that kills the channel.
+    src.Log.print_with_color(describe_transport_plan(transport_plan(config)), "cyan")
 
     src.Log.print_with_color("[>>>] Client sending registration message to server...", "red")
 

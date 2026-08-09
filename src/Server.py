@@ -11,7 +11,8 @@ import src.Log
 import src.Results
 from src.Utils import (get_intermediate_queue_args, get_bbox_queue_args,
                        get_publish_slots, get_slot_queue_args,
-                       raw_frame_transport_plan, describe_transport_plan)
+                       transport_plan, describe_transport_plan,
+                       cloud_work_queue, slot_queue_for)
 from ultralytics import YOLO
 
 from src.Clustering import (
@@ -82,24 +83,23 @@ class Server:
                                    arguments=get_bbox_queue_args(config))
         self.channel.queue_purge(queue='bbox_queue')
 
-        # slot_queue: publish permits for raw-frame batches, pre-filled with one
-        # token per allowed in-flight batch. An edge must hold a token before it
-        # starts transmitting and the cloud returns one as soon as it pulls a
-        # batch off intermediate_queue, so the number of ~150 MB bodies the
-        # broker holds at once is bounded by the token count rather than by the
-        # edge count — intermediate_queue's own x-max-length cannot do that,
-        # because it is evaluated only after the body has been received in full.
+        # Publish permits live in one pool PER CLOUD WORK QUEUE, pre-filled with
+        # one token per allowed resident message. An edge must hold a token before
+        # it starts transmitting and the cloud returns one as soon as it pulls a
+        # message off its queue, so the number of bodies the broker holds at once
+        # is bounded by the token count rather than by the edge count — a queue's
+        # own x-max-length cannot do that, because it is evaluated only after the
+        # body has been received in full.
         #
-        # The queue is itself length-capped (get_slot_queue_args): a permit pool
+        # Each pool is itself length-capped (get_slot_queue_args): a permit pool
         # that can over-fill provides no protection at all, since it then hands
         # out permits to every edge at once. That cap is the actual guarantee;
-        # the accounting below is just the common case.
-        self.channel.queue_declare(queue='slot_queue', durable=False,
-                                   arguments=get_slot_queue_args(config))
-        self.channel.queue_purge(queue='slot_queue')
+        # the accounting is just the common case.
+        #
+        # Set up in _setup_work_queues, not here: the cloud-to-queue mapping is
+        # only known once the clouds have registered.
         self.publish_slots = get_publish_slots(config)
-        for _ in range(self.publish_slots):
-            self.channel.basic_publish(exchange='', routing_key='slot_queue', body=b'1')
+        self.cloud_work_queues = {}   # base cluster queue -> [per-cloud queue, ...]
 
         # fps_queue: every cloud publishes one tiny "done" ping per completed
         # batch; the server consumes them (on_fps_done) and computes FPS live.
@@ -186,9 +186,9 @@ class Server:
         self.batch_log_path = self.result_files["batch"]
         self.utilization_log_path = self.result_files["util"]
         self.logger = src.Log.Logger(f"{log_path}/app.log", config["debug-mode"])
-        plan = raw_frame_transport_plan(config)
+        plan = transport_plan(config)
         src.Log.print_with_color(describe_transport_plan(plan),
-                                 "cyan" if plan["permits"] > 0 else "yellow")
+                                 "cyan" if plan["capacity"] > 0 else "yellow")
         self.logger.log_info(f"Application start. Server is waiting for {self.total_clients} clients.")
         src.Log.print_with_color(f"Application start. Server is waiting for {self.total_clients} clients.", "green")
 
@@ -620,6 +620,58 @@ class Server:
 
         return solver, result
 
+    def _setup_work_queues(self, clients_to_notify):
+        """Give every cloud its own raw-frame work queue, each with its own
+        permit pool, and record the per-base lists the edges choose between.
+
+        Chunking is what forces this. A batch cut into chunks can only be merged
+        if every chunk reaches the SAME cloud, and a queue shared by 3 clouds
+        cannot promise that — the broker hands chunk 1 to whoever asks first and
+        chunk 2 to whoever asks next. One queue per cloud makes the guarantee
+        structural instead of negotiated (Utils.cloud_work_queue).
+
+        Runs here rather than in __init__ because the cloud-to-queue mapping is
+        only known once the clouds have registered. Nothing races: the edges
+        cannot publish until they receive START, which is sent after this.
+
+        Only the raw-frame modes need it. only_edge and split send one small
+        message per batch that nobody has to merge, so they keep using the shared
+        base queue and this is a no-op.
+        """
+        self.cloud_work_queues = {}
+        if self._get_mode() not in ("only_cloud", "adaptive"):
+            return
+        cloud_layer = len(self.total_clients)
+        per_base = {}
+        for (client_id, layer_id) in clients_to_notify:
+            if layer_id != cloud_layer:
+                continue
+            assignment = self.client_assignments.setdefault(client_id, {})
+            base = assignment.get("queue_name", "intermediate_queue")
+            qname = cloud_work_queue(base, len(per_base.setdefault(base, [])))
+            per_base[base].append(qname)
+            assignment["work_queue"] = qname
+
+        for base, queues in per_base.items():
+            for qname in queues:
+                self.channel.queue_declare(queue=qname, durable=False,
+                                           arguments=get_intermediate_queue_args(self.config))
+                self.channel.queue_purge(queue=qname)
+                # Watched by the post-STOP drain, so the server cannot shut down
+                # while a cloud still has queued chunks to process.
+                if qname not in self._work_queues:
+                    self._work_queues.append(qname)
+                pool = slot_queue_for(qname)
+                self.channel.queue_declare(queue=pool, durable=False,
+                                           arguments=get_slot_queue_args(self.config))
+                self.channel.queue_purge(queue=pool)
+                for _ in range(self.publish_slots):
+                    self.channel.basic_publish(exchange='', routing_key=pool, body=b'1')
+            src.Log.print_with_color(
+                f"[Slots] {base}: {len(queues)} cloud queues x {self.publish_slots} "
+                f"permits -> {', '.join(queues)}", "cyan")
+        self.cloud_work_queues = per_base
+
     def notify_clients(self, start=True):
         if start:
             default_splits = {"a": 4, "b": 11, "c": 17, "d": 23}
@@ -714,14 +766,23 @@ class Server:
                 f"Sending model {self.model_name} to {len(clients_to_notify)} clients "
                 f"(list_clients={len(self.list_clients)}).", "green")
 
+            self._setup_work_queues(clients_to_notify)
+
             for (client_id, layer_id) in clients_to_notify:
                 assignment = self.client_assignments.get(client_id, {})
+                base = assignment.get("queue_name", "intermediate_queue")
                 response = {
                     "action":     "START",
                     "message":    "Server accept the connection",
                     "model":      encoded,
                     "splits":     assignment.get("splits",     splits),
-                    "queue_name": assignment.get("queue_name", "intermediate_queue"),
+                    "queue_name": base,
+                    # The queue this device consumes (cloud) and the queues an edge
+                    # may publish to. Both fall back to the shared base queue in
+                    # the modes that don't use per-cloud queues, which is exactly
+                    # the pre-existing behaviour.
+                    "work_queue":  assignment.get("work_queue", base),
+                    "work_queues": self.cloud_work_queues.get(base, [base]),
                     "batch_size": self.batch_size,
                     "num_layers": len(self.total_clients),
                     "model_name": self.model_name,

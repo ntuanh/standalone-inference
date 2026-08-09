@@ -1,5 +1,6 @@
 import torch
 import cv2
+import math
 import pickle
 import traceback
 from tqdm import tqdm
@@ -15,12 +16,15 @@ from src.Compress import Encoder,Decoder
 import src.Log as Log
 from src.Model import inference, postprocess_yolo
 from src.Utils import (get_intermediate_queue_args, get_bbox_queue_args,
-                       get_publish_slots, get_slot_queue_args)
+                       get_publish_slots, get_slot_queue_args,
+                       transport_plan, slot_queue_for)
 
-# Raw-frame batches (~150 MB/msg in only_cloud and on adaptive's split route)
-# are bounded by the slot_queue permit pool, sized from the broker RAM budget in
-# rabbit.broker-ram-budget-mb — see Utils.raw_frame_transport_plan,
-# Utils.get_publish_slots and Scheduler._acquire_slot. The depth-poll this
+# Raw-frame batches (~150 MB/batch in only_cloud and on adaptive's split route)
+# are bounded by one permit pool per cloud work queue, sized from `a`
+# (rabbit.max-queue-messages) — see Utils.transport_plan, Utils.get_publish_slots
+# and Scheduler._acquire_any_slot. When a < 1 a batch travels as several labelled
+# chunks and the owning cloud merges them (_send_frames / _take_chunk), so the
+# resident payload is a fraction of a batch. The depth-poll this
 # replaced could not bound broker memory: a message is invisible to the queue's
 # message_count until the broker has received all of it, so every edge polling
 # during a multi-second upload read an empty queue and transmitted anyway.
@@ -34,6 +38,10 @@ class Scheduler:
         self.device = device
 
         cid_short = str(client_id).replace('-', '')[:12]
+        # Also the chunk label prefix: batch ids restart at 0 on every edge, so
+        # the device id is what keeps two edges' batch 7 from colliding in a
+        # cloud's reassembly buffer.
+        self._cid_short = cid_short
         self._timing_log_edge  = f"timing_edge_{cid_short}.log"
         self._timing_log_cloud = f"timing_cloud_{cid_short}.log"
         for tlog in [self._timing_log_edge, self._timing_log_cloud]:
@@ -67,12 +75,29 @@ class Scheduler:
         # time-axis chart.
         self.events_queue = "events_queue"
         self.channel.queue_declare(self.events_queue, durable=False)
-        # Publish permits for raw-frame batches (server pre-fills the pool).
-        # Edge takes one before transmitting, cloud returns one after fetching.
-        self.slot_queue = "slot_queue"
-        self.channel.queue_declare(self.slot_queue, durable=False,
-                                   arguments=get_slot_queue_args())
+        # Raw-frame work queues, one per cloud, learned from START (inference_func)
+        # — declared there, not here, since this runs before registration.
+        #   work_queue  : the queue THIS cloud consumes
+        #   work_queues : every cloud queue an edge may publish to
+        # Each has its own permit pool (Utils.slot_queue_for). The server pre-fills
+        # them; an edge takes a permit before transmitting, the owning cloud returns
+        # one as soon as it pulls a message off its queue.
+        self.work_queue = self.intermediate_queue
+        self.work_queues = [self.intermediate_queue]
         self._publish_slots = get_publish_slots()
+        self._rr = 0             # rotating first choice, so load spreads over clouds
+        # Chunk geometry from `a`: a batch travels as `chunks` messages of
+        # `frames_per_chunk` frames, labelled in the AMQP headers and merged by the
+        # owning cloud before inference.
+        _plan = transport_plan()
+        self._chunks = _plan["chunks"]
+        self._frames_per_chunk = _plan["frames_per_chunk"]
+        # Cloud side: partially arrived batches, batch_key -> {index: raw body}.
+        # Raw bodies, not unpickled: the label lives in the headers, so a partial
+        # chunk costs no deserialisation and the merge stays inside the timed
+        # region where the whole-batch unpickle has always been counted.
+        self._chunk_buf = {}
+        self._chunk_seen = {}    # batch_key -> monotonic time its first chunk landed
         self._my_metrics_queue = None  # set by _setup_metrics_fanout_queue
 
         # Raw per-unit latency samples, shipped as arrays with this device's
@@ -173,8 +198,7 @@ class Scheduler:
                 self.channel.queue_declare(self.fps_queue, durable=False)
                 self.channel.queue_declare(self.utilization_queue, durable=False)
                 self.channel.queue_declare(self.events_queue, durable=False)
-                self.channel.queue_declare(self.slot_queue, durable=False,
-                                   arguments=get_slot_queue_args())
+                self._declare_work_queues()
                 if self._confirms_enabled:
                     self._confirms_enabled = False
                     self._enable_publisher_confirms()
@@ -184,14 +208,26 @@ class Scheduler:
                 Log.print_with_color(f"[Reconnect] Retry in 1s ({e})", "yellow")
                 time.sleep(1.0)
 
-    def _acquire_slot(self, timeout_s=None):
-        """Take one raw-frame publish permit; True once this device holds one.
+    def _declare_work_queues(self):
+        """Declare every raw-frame work queue this device touches plus its permit
+        pool. Idempotent, and the arguments must match the server's declares
+        exactly or the broker answers PRECONDITION_FAILED — which is why both
+        sides read them from the same getters."""
+        for qname in dict.fromkeys(list(self.work_queues) + [self.work_queue]):
+            self.channel.queue_declare(qname, durable=False,
+                                       arguments=get_intermediate_queue_args())
+            self.channel.queue_declare(slot_queue_for(qname), durable=False,
+                                       arguments=get_slot_queue_args())
 
-        The permit — not the depth probe — is what reserves room for a ~150 MB
-        body. A depth check is stale for the whole upload, because the message
-        does not count towards the queue until the broker has received all of
-        it, so every edge that checks during that window sees an empty queue
-        and starts transmitting too.
+    def _acquire_slot(self, queue_name, timeout_s=None):
+        """Take one publish permit for `queue_name`; True once this device holds
+        one.
+
+        The permit — not a depth probe — is what reserves room for a big body. A
+        depth check is stale for the whole upload, because the message does not
+        count towards the queue until the broker has received all of it, so every
+        edge that checks during that window sees an empty queue and starts
+        transmitting too.
 
         timeout_s=None blocks until a permit frees up (only_cloud has nowhere
         else to send the batch); 0.0 tries once and gives up, which lets
@@ -199,11 +235,11 @@ class Scheduler:
         """
         if not self._publish_slots:
             return True
+        pool = slot_queue_for(queue_name)
         deadline = None if timeout_s is None else time.time() + timeout_s
         while True:
             try:
-                method_frame, _, _ = self.channel.basic_get(
-                    queue=self.slot_queue, auto_ack=True)
+                method_frame, _, _ = self.channel.basic_get(queue=pool, auto_ack=True)
                 if method_frame:
                     return True
             except self._CONN_ERRORS:
@@ -216,15 +252,46 @@ class Scheduler:
             except Exception:
                 time.sleep(0.02)
 
-    def _release_slot(self):
-        """Return a permit to the pool. Called by the cloud the moment it pulls
-        a raw-frame batch off intermediate_queue — that is when the body stops
-        occupying broker memory, so that is when the next edge may transmit."""
+    def _acquire_any_slot(self, timeout_s=None):
+        """Pick a cloud by taking a permit from one of the per-cloud pools, and
+        return that cloud's queue name (None when none had room in time).
+
+        The choice IS the load balancing, and it is honest by construction: a
+        permit exists only if that cloud has drained what it was already sent, so
+        a backed-up cloud simply stops being chosen. The starting point rotates so
+        two edges that finish a batch together do not both pile onto cloud 0.
+
+        timeout_s=0.0 sweeps every cloud once and gives up — that is the adaptive
+        routing probe. None keeps sweeping until somebody frees a permit.
+        """
+        if not self.work_queues:
+            return None
+        deadline = None if timeout_s is None else time.time() + timeout_s
+        while True:
+            n = len(self.work_queues)
+            for i in range(n):
+                qname = self.work_queues[(self._rr + i) % n]
+                if self._acquire_slot(qname, timeout_s=0.0):
+                    self._rr = (self._rr + i + 1) % n
+                    return qname
+            if deadline is not None and time.time() >= deadline:
+                return None
+            try:
+                self.channel.connection.sleep(0.02)
+            except Exception:
+                time.sleep(0.02)
+
+    def _release_slot(self, queue_name):
+        """Return a permit to `queue_name`'s pool. Called by the cloud the moment
+        it pulls a message off its work queue — that is when the body stops
+        occupying broker memory, so that is when the next edge may transmit.
+        Released per CHUNK, not per batch: a chunk that has been delivered is no
+        longer resident, whether or not its batch is complete yet."""
         if not self._publish_slots:
             return
         try:
             self.channel.basic_publish(
-                exchange='', routing_key=self.slot_queue, body=b'1')
+                exchange='', routing_key=slot_queue_for(queue_name), body=b'1')
         except Exception as e:
             Log.print_with_color(f"[Slots] release failed: {e}", "yellow")
 
@@ -242,7 +309,83 @@ class Scheduler:
             # the depth-poll back-pressure, which still bounds the queue.
             Log.print_with_color(f"[Overflow] confirm_delivery() not enabled: {e}", "yellow")
 
-    def _publish_intermediate(self, queue_name, body):
+    def _send_frames(self, queue_name, y, batch_id):
+        """Publish one raw-frame batch to `queue_name` as `a`-sized messages.
+
+        A permit is taken per chunk, so the queue holds at most `a` batches'
+        worth at any instant even when the batch itself is larger than that —
+        that is the whole point of a < 1. The caller already holds the permit for
+        chunk 0 (acquiring it is what chose this cloud), so only later chunks
+        wait.
+
+        The label goes in the AMQP headers rather than the body so the cloud can
+        tell a partial batch from a whole one without unpickling ~150 MB, and so
+        the merge stays inside the timed region where the unpickle has always
+        been counted. chunk_total is computed from the ACTUAL split rather than
+        from the configured chunk count: batch_size / frames_per_chunk can come
+        out short (batch 10 into 7 chunks is really 5), and the cloud would wait
+        forever for chunks that were never going to be sent.
+        """
+        frames = y["data"]
+        per = max(1, self._frames_per_chunk)
+        total = max(1, int(math.ceil(len(frames) / per)))
+        key = f"{self._cid_short}-{batch_id}"
+        size = 0
+        for index in range(total):
+            if index:
+                # Blocking is the back-pressure. The batch is already committed to
+                # this cloud; abandoning it half-sent would leave that cloud
+                # holding chunks it can never complete.
+                self._acquire_slot(queue_name, timeout_s=None)
+            part = {k: v for k, v in y.items() if k != "data"}
+            part["data"] = [t.cpu() if isinstance(t, torch.Tensor) else None
+                            for t in frames[index * per:(index + 1) * per]]
+            body = pickle.dumps({"action": "OUTPUT", "data": part})
+            size += len(body)
+            self._publish_intermediate(
+                queue_name, body,
+                properties=pika.BasicProperties(headers={
+                    "batch_key": key, "chunk_index": index, "chunk_total": total}))
+        self.size_message = size
+
+    def _take_chunk(self, headers, body):
+        """Cloud side: fold one arrived message into its batch.
+
+        Returns the list of bodies making up a COMPLETE batch (oldest chunk
+        first), or None while chunks are still missing. An unlabelled message —
+        a bbox, an only_edge result, anything published without headers — is a
+        complete batch of one, which is how every pre-chunking path keeps working
+        unchanged.
+        """
+        total = int((headers or {}).get("chunk_total", 1) or 1)
+        if total <= 1:
+            return [body]
+        key = (headers or {}).get("batch_key")
+        buf = self._chunk_buf.setdefault(key, {})
+        if not buf:
+            self._chunk_seen[key] = time.monotonic()
+        buf[int((headers or {}).get("chunk_index", 0))] = body
+        if len(buf) < total:
+            self._prune_chunk_buf()
+            return None
+        self._chunk_buf.pop(key, None)
+        self._chunk_seen.pop(key, None)
+        return [buf[i] for i in sorted(buf)]
+
+    def _prune_chunk_buf(self, max_age_s=300.0):
+        """Drop batches whose remaining chunks are never coming — an edge that
+        died mid-batch would otherwise pin its frames in this cloud's memory for
+        the rest of the run. Loud, because it means frames were lost."""
+        now = time.monotonic()
+        for key in [k for k, t in self._chunk_seen.items() if now - t > max_age_s]:
+            held = len(self._chunk_buf.get(key, {}))
+            self._chunk_buf.pop(key, None)
+            self._chunk_seen.pop(key, None)
+            Log.print_with_color(
+                f"[Chunk] dropped incomplete batch {key} after {max_age_s:.0f}s "
+                f"({held} chunks held) — sender stopped mid-batch", "yellow")
+
+    def _publish_intermediate(self, queue_name, body, properties=None):
         """Publish one batch to intermediate_queue with broker overflow handling.
 
         With publisher confirms on and the queue declared 'x-overflow:
@@ -255,7 +398,8 @@ class Scheduler:
         (split feature maps, only_edge / adaptive bboxes)."""
         while True:
             try:
-                self.channel.basic_publish(exchange='', routing_key=queue_name, body=body)
+                self.channel.basic_publish(exchange='', routing_key=queue_name,
+                                           body=body, properties=properties)
                 return
             except (pika.exceptions.NackError, pika.exceptions.UnroutableError):
                 Log.print_with_color(
@@ -622,23 +766,20 @@ class Scheduler:
                         "edge_start_time": edge_start_wall
                     }
 
-                    # Block until a permit is free — only_cloud has no local
-                    # fallback, so waiting here IS the back-pressure. Nothing
-                    # goes on the wire until the broker has room for it.
+                    # Block until some cloud has a permit free — only_cloud has no
+                    # local fallback, so waiting here IS the back-pressure. Nothing
+                    # goes on the wire until that cloud's queue has room for it,
+                    # and the permit also picks which cloud owns this batch.
                     _wait_start = time.perf_counter()
                     with open(self._timing_log_edge, "a") as _tf:
                         print(str(time.time_ns()) + " queue_wait_start", file=_tf)
-                    self._acquire_slot()
+                    target = self._acquire_any_slot(timeout_s=None)
                     with open(self._timing_log_edge, "a") as _tf:
                         print(str(time.time_ns()) + " queue_wait_end", file=_tf)
                     queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
 
                     _send_start = time.perf_counter()
-                    self.send_next_layer(
-                        self.intermediate_queue,
-                        y,
-                        {"enable": False}
-                    )
+                    self._send_frames(target, y, batch_id)
                     send_ms = (time.perf_counter() - _send_start) * 1000
 
                 # ===== ONLY EDGE =====
@@ -688,7 +829,8 @@ class Scheduler:
                     # Decide, report the flip, then act — so the server's arrival
                     # timestamp marks when the controller changed its mind rather
                     # than when the resulting batch happened to finish.
-                    route_path = "split" if self._acquire_slot(timeout_s=0.0) else "edge_only"
+                    target = self._acquire_any_slot(timeout_s=0.0)
+                    route_path = "split" if target else "edge_only"
                     self._note_route(route_path)
                     if route_path == "split":
                         # --- Cloud has capacity → offload raw frames (full cloud YOLO) ---
@@ -699,10 +841,11 @@ class Scheduler:
                             "height": height,
                             "edge_start_time": edge_start_wall,
                         }
-                        # Permit already held (that is what chose this route), so
-                        # the queue is guaranteed to have room — no wait needed.
+                        # Permit already held (that is what chose this route AND
+                        # this cloud), so the first chunk needs no wait; later
+                        # chunks, if a < 1, wait inside _send_frames.
                         _send_start = time.perf_counter()
-                        self.send_next_layer(self.intermediate_queue, y, {"enable": False})
+                        self._send_frames(target, y, batch_id)
                         send_ms = (time.perf_counter() - _send_start) * 1000
                     else:
                         # --- Cloud backlogged → run full YOLO locally, ship bboxes ---
@@ -893,10 +1036,13 @@ class Scheduler:
             print(str(time.time_ns()) + " start", file=_tf)
         while True:
             try:
-                method_frame, header_frame, body = self.channel.basic_get(queue=self.intermediate_queue, auto_ack=True)
+                # This cloud's OWN work queue, so every chunk of a batch an edge
+                # sent here is guaranteed to come back to this same consumer and
+                # can be merged (Utils.cloud_work_queue).
+                method_frame, header_frame, body = self.channel.basic_get(queue=self.work_queue, auto_ack=True)
                 src_queue = "intermediate"
                 # adaptive: if no raw batch to run, drain edge-computed bboxes (metrics only).
-                # intermediate_queue is checked first so cloud YOLO always has priority.
+                # the work queue is checked first so cloud YOLO always has priority.
                 if not (method_frame and body) and mode == "adaptive":
                     method_frame, header_frame, body = self.channel.basic_get(queue=self.bbox_queue, auto_ack=True)
                     src_queue = "bbox"
@@ -912,7 +1058,17 @@ class Scheduler:
                 # whole (seconds-long) forward pass. Only raw-frame batches consume
                 # a permit — adaptive bbox messages and only_edge results do not.
                 if src_queue == "intermediate" and mode in ("only_cloud", "adaptive"):
-                    self._release_slot()
+                    self._release_slot(self.work_queue)
+                # Fold this message into its batch. A chunk that does not complete
+                # one is buffered and we go straight back for the next message —
+                # before the timers start, so a partial batch neither opens a
+                # 'get input' the utilization pairing would never see closed, nor
+                # charges the wait for the rest of the batch to this device's busy
+                # time. An unlabelled message is a complete batch of one, which is
+                # every path that existed before chunking.
+                bodies = self._take_chunk(header_frame.headers if header_frame else None, body)
+                if bodies is None:
+                    continue
                 t_batch_ready = time.perf_counter()
                 gap_ms = (t_batch_ready - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
                 # One reading, used for both the timing log and the 'service'
@@ -921,9 +1077,19 @@ class Scheduler:
                 with open(self._timing_log_cloud, "a") as _tf:
                     print(str(t_get_input_ns) + " get input", file=_tf)
                 batch_start = time.perf_counter()
-                received_message_size = len(body)
-                received_data = pickle.loads(body)
+                received_message_size = sum(len(b) for b in bodies)
+                parts = [pickle.loads(b) for b in bodies]
+                received_data = parts[0]
                 y = received_data["data"]
+                if len(parts) > 1:
+                    # Rebuild the batch from its chunks, in label order. Metadata
+                    # comes from chunk 0 — every chunk carries the same values,
+                    # including edge_start_time, so e2e still measures from when
+                    # the edge started the WHOLE batch.
+                    frames = []
+                    for part in parts:
+                        frames.extend(part["data"]["data"])
+                    y["data"] = frames
                 edge_start_time = y.get("edge_start_time", time.time())
 
                 # adaptive routes per message: a raw batch on intermediate_queue runs
@@ -1302,11 +1468,25 @@ class Scheduler:
         if self._det_results:
             self._write_detections_json()
 
-    def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None):
+    def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None,
+                       work_queue=None, work_queues=None):
         if queue_name != self.intermediate_queue:
             self.intermediate_queue = queue_name
             self.channel.queue_declare(self.intermediate_queue, durable=False,
                                        arguments=get_intermediate_queue_args())
+
+        # Raw-frame routing, assigned by the server now that it knows every cloud:
+        # work_queue is the one this device consumes, work_queues the ones an edge
+        # may publish to. Both default to the cluster's shared base queue, which
+        # is what only_edge and split use — they send one unmergeable message per
+        # batch, so they need no per-cloud affinity.
+        self.work_queue = work_queue or self.intermediate_queue
+        self.work_queues = list(work_queues) if work_queues else [self.work_queue]
+        self._declare_work_queues()
+        Log.print_with_color(
+            f"[Slots] work_queue={self.work_queue} "
+            f"choices={self.work_queues} chunks/batch={self._chunks} "
+            f"({self._frames_per_chunk} frames each)", "cyan")
 
         if self.layer_id == 1:
             try:

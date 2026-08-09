@@ -21,29 +21,29 @@ FRAME_BYTES = 640 * 640 * 3 * 4          # 4,915,200 B = 4.6875 MiB
 SERVER_LOCK_QUEUE = "server_lock"
 
 
-def cloud_work_queue(base, index):
-    """The dedicated raw-frame work queue for one cloud.
+# Two single-token locks, held only while a < 1 (i.e. while a batch travels as
+# several chunks through the ONE shared intermediate_queue). Neither carries
+# data; both exist to make the chunk sequence exclusive end to end:
+#
+#   lock_transfer  one EDGE at a time may be mid-batch. Without it, the moment
+#                  the cloud frees a publish permit after chunk 0, a different
+#                  edge could take it and interleave its own chunk 0 into the
+#                  queue.
+#   lock_fetch     one CLOUD at a time may be assembling. Without it, chunk 0
+#                  goes to whichever cloud polls first and chunk 1 to whichever
+#                  polls next, and neither can merge the batch. The publish side
+#                  cannot fix this: serialising the senders says nothing about
+#                  which of the 3 consumers takes the next message.
+#
+# Together they give exactly the required sequence: edge 1 sends the first half,
+# cloud 1 takes it, nobody else publishes or fetches, edge 1 sends the second
+# half, cloud 1 takes that too and merges.
+TRANSFER_LOCK_QUEUE = "lock_transfer"
+FETCH_LOCK_QUEUE = "lock_fetch"
 
-    Each cloud consumes ONLY its own queue. That is what makes chunking work:
-    with a shared queue the 3 clouds compete, so chunk 1 of a batch goes to one
-    cloud and chunk 2 to another and neither can merge them. Giving each cloud
-    its own queue means every chunk an edge sends for a batch lands on the same
-    consumer by construction, with no claim handshake.
-
-    `base` stays the CLUSTER identity (intermediate_queue, or
-    intermediate_queue_k under clustering) and is what the FPS pings, metrics
-    filenames, fanout exchange and utilization reports are keyed on — the
-    per-cloud suffix must never leak into those, or one cluster's results
-    fragment into three.
-    """
-    return f"{base}_c{int(index)}"
-
-
-def slot_queue_for(work_queue):
-    """Permit pool guarding one cloud work queue. Named with the 'slot_queue'
-    prefix so delete_old_queues still deletes it (its arguments change with
-    `a`, and re-declaring with different arguments is a PRECONDITION_FAILED)."""
-    return f"slot_queue_{work_queue}"
+# A lock queue holds one token and cannot over-fill: a duplicate token would let
+# two holders in at once, which is the failure the lock exists to prevent.
+LOCK_QUEUE_ARGS = {'x-max-length': 1, 'x-overflow': 'drop-head'}
 
 
 def _load_config(config):
@@ -62,7 +62,7 @@ def transport_plan(config=None):
     `a` is the cap on ONE cloud work queue, measured in whole raw-frame batch
     messages, and it may be fractional:
 
-        a = 2     2 full batch messages resident per cloud queue
+        a = 2     2 full batch messages resident
         a = 1     1 full batch message
         a = 0.5   half a batch: the batch is cut into 2 chunks, 1 resident
         a = 0.25  a quarter:    4 chunks, 1 resident
@@ -93,8 +93,6 @@ def transport_plan(config=None):
     rabbit = config.get('rabbit', {}) or {}
     server = config.get('server') or {}
     batch_size = int(server.get('batch-size') or 0)
-    clients = server.get('clients') or []
-    num_clouds = int(clients[-1]) if len(clients) > 1 else 1
     a = float(rabbit.get('max-queue-messages') or 0)
 
     if a <= 0 or batch_size <= 0:
@@ -116,34 +114,30 @@ def transport_plan(config=None):
     return {
         "a": a,
         "batch_size": batch_size,
-        "num_clouds": num_clouds,
         "chunks": chunks,                        # messages per batch
         "frames_per_chunk": frames_per_chunk,
-        "capacity": capacity,                    # x-max-length AND permits per pool
+        "capacity": capacity,                    # x-max-length AND permit count
         "body_bytes": batch_size * FRAME_BYTES,  # one whole batch
         "chunk_bytes": chunk_bytes,              # one message
-        "peak_per_queue_bytes": capacity * chunk_bytes,
-        "peak_total_bytes": capacity * chunk_bytes * num_clouds,
+        "peak_bytes": capacity * chunk_bytes,    # everything the broker holds
     }
 
 
 def describe_transport_plan(plan):
     """Startup banner spelling out the geometry `a` produced, so a run's log
-    records the bound it actually operated under. Reports the whole-broker total
-    as well as the per-queue cap: `a` caps ONE cloud queue, and there is one
-    such queue per cloud, so the broker holds up to num_clouds x that."""
+    records the bound it actually operated under. There is ONE shared work
+    queue, so this peak is the whole broker, not a per-consumer share."""
     if plan["capacity"] <= 0:
-        return ("[Slots] disabled — rabbit.max-queue-messages is unset; queues are "
+        return ("[Slots] disabled — rabbit.max-queue-messages is unset; the queue is "
                 "uncapped, no publish permits, broker memory is UNBOUNDED")
-    split = (f"batch of {plan['batch_size']} split into {plan['chunks']} x "
-             f"{plan['frames_per_chunk']} frames"
-             if plan["chunks"] > 1 else
-             f"batch of {plan['batch_size']} in one message")
+    if plan["chunks"] > 1:
+        split = (f"batch of {plan['batch_size']} sent as {plan['chunks']} chunks of "
+                 f"{plan['frames_per_chunk']} frames, merged by one cloud")
+    else:
+        split = f"batch of {plan['batch_size']} in one message"
     return (
-        f"[Slots] a={plan['a']:g} -> {split}, {plan['capacity']} resident per cloud "
-        f"queue = {plan['peak_per_queue_bytes'] / _MB:.0f} MiB each; "
-        f"{plan['num_clouds']} cloud queues -> {plan['peak_total_bytes'] / _MB:.0f} MiB "
-        f"peak in the broker"
+        f"[Slots] a={plan['a']:g} -> {split}; {plan['capacity']} resident in "
+        f"intermediate_queue = {plan['peak_bytes'] / _MB:.0f} MiB peak in the broker"
     )
 
 
@@ -166,12 +160,9 @@ def _overflow_args(max_len, overflow):
 
 
 def get_intermediate_queue_args(config=None):
-    """Overflow args for a raw-frame work queue — `capacity` messages, which is
-    also the size of that queue's permit pool, so a held permit always
-    corresponds to a free slot and a permitted publish can never be NACKed.
-
-    Also used for the shared base intermediate_queue, which in only_edge / split
-    mode carries whole (unchunked) messages."""
+    """Overflow args for intermediate_queue / intermediate_queue_k — `capacity`
+    messages, which is also the size of the permit pool, so a held permit always
+    corresponds to a free slot and a permitted publish can never be NACKed."""
     rabbit = _load_config(config).get('rabbit', {}) or {}
     return _overflow_args(transport_plan(config)["capacity"],
                           rabbit.get('overflow', 'reject-publish'))
@@ -188,7 +179,7 @@ def get_bbox_queue_args(config=None):
 
 
 def get_slot_queue_args(config=None):
-    """Args for a permit pool (one per cloud work queue, slot_queue_for()).
+    """Args for slot_queue — the publish permit pool.
 
     The cap is the whole point: it makes the pool physically incapable of
     holding more permits than `a` allows, so broker RAM stays bounded even when
@@ -209,11 +200,11 @@ def get_slot_queue_args(config=None):
 
 
 def get_publish_slots(config=None):
-    """Permits in ONE cloud queue's pool — how many chunks that cloud may have
-    resident at once. Equal to that queue's x-max-length deliberately: an edge
-    takes a permit from the pool BEFORE it transmits, so holding a permit
-    guarantees a free slot and the publish cannot be NACKed. That matters
-    because a NACK costs a full retransmission of the body.
+    """Permits in slot_queue — how many messages may be resident in
+    intermediate_queue at once. Equal to its x-max-length deliberately: an edge
+    takes a permit BEFORE it transmits, so holding a permit guarantees a free
+    slot and the publish cannot be NACKed. That matters because a NACK costs a
+    full retransmission of the body.
 
     'x-max-length' alone cannot bound broker memory — the broker must receive a
     message in full before it can evaluate the limit and reject it, so all 9
@@ -299,7 +290,7 @@ def delete_old_queues(address, username, password, virtual_host):
             # PRECONDITION_FAILED that closes the channel.
             try:
                 if queue_name.startswith("reply") or queue_name.startswith("intermediate_queue") or queue_name.startswith(
-                        "result") or queue_name.startswith("rpc_queue") or queue_name.startswith("bbox_queue") or queue_name.startswith("mfq") or queue_name.startswith("slot_queue"):
+                        "result") or queue_name.startswith("rpc_queue") or queue_name.startswith("bbox_queue") or queue_name.startswith("mfq") or queue_name.startswith("slot_queue") or queue_name.startswith("lock_"):
 
                     http_channel.queue_delete(queue=queue_name)
 

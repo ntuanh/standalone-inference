@@ -23,37 +23,47 @@ rabbit:
   username: "machine-1"
   password: "123456"
   virtual-host: /
-  # ---- a: max messages resident in one cloud's work queue -----------------
-  # Measured in WHOLE raw-frame batch messages, and it may be fractional.
-  # src/Utils.transport_plan turns it into the queue geometry:
+  # ---- a: max messages resident in intermediate_queue ---------------------
+  # ONE shared queue. `a` is measured in WHOLE raw-frame batch messages and may
+  # be fractional. src/Utils.transport_plan turns it into the geometry:
   #
-  #   a = 2     2 full batch messages resident      2 x 150 = 300 MiB per queue
-  #   a = 1     1 full batch message                      150 MiB per queue
-  #   a = 0.5   batch cut into 2 chunks, 1 resident        75 MiB per queue
-  #   a = 0.25  batch cut into 4 chunks, 1 resident        37 MiB per queue
+  #   a = 2     2 full batch messages resident      2 x 150 = 300 MiB
+  #   a = 1     1 full batch message                      150 MiB
+  #   a = 0.5   batch sent as 2 chunks, 1 resident         75 MiB
+  #   a = 0.25  batch sent as 4 chunks, 1 resident         37 MiB
+  #
+  # That MiB figure is the whole broker, not a per-consumer share.
   #
   # a >= 1 keeps one message per batch and caps the queue at floor(a). a < 1
   # cannot be expressed as a message count, so the MESSAGE is made smaller
-  # instead: the batch is cut into ceil(1/a) chunks and the queue holds one.
-  # ceil rounds the resident payload down, never up (a = 0.6 -> 2 chunks -> 0.5
-  # batches), so a is a bound that is undershot, not exceeded.
+  # instead: a chunk carries floor(a x batch-size) frames, and it takes
+  # ceil(batch-size / that) chunks to move a batch. Flooring the frames keeps
+  # the resident payload at or below a — undershot, never exceeded. One frame is
+  # indivisible, so below a = 1/batch-size the chunk stops shrinking.
   #
   # Chunks are labelled in the AMQP headers (batch_key, chunk_index, chunk_total)
-  # and merged by the cloud BEFORE inference, so a batch is still one unit of
-  # work however many messages carried it — latency, e2e, FPS and mAP accounting
-  # do not change with a.
+  # and merged back into the full batch BEFORE inference, so a batch is still one
+  # unit of work however many messages carried it — latency, e2e, FPS and mAP
+  # accounting do not change with a.
   #
-  # a is per QUEUE, and each cloud has its own work queue (the merge needs every
-  # chunk of a batch to reach the same consumer), so the broker holds up to
-  #   clients[1] x a x batch_body     = 3 x 0.5 x 150 MiB = 225 MiB at a = 0.5.
-  # The server prints the arithmetic it computed as a [Slots] line at startup —
-  # read it there, not here.
+  # For a < 1 the chunk sequence is exclusive at both ends, via two single-token
+  # lock queues (lock_transfer, lock_fetch):
+  #   edge 1 takes lock_transfer, sends the first half
+  #   cloud 1 takes lock_fetch, takes that half, frees the publish permit
+  #   no other edge publishes and no other cloud fetches meanwhile
+  #   edge 1 sends the second half, cloud 1 takes it and merges the full batch
+  #   both locks are released
+  # Serialising only the senders would not be enough: it says nothing about which
+  # of the 3 clouds takes the next message off a shared queue.
   #
-  # a is also the size of each queue's slot_queue permit pool. The permit, not
+  # a is also the size of the slot_queue permit pool. The permit, not
   # x-max-length, is what actually bounds RAM: x-max-length is evaluated only
   # after the broker has received a body in full, so without permits all 9 edges
   # can each push a complete message before any one is rejected. The permit is
   # taken BEFORE transmitting.
+  #
+  # The server prints the arithmetic it computed as a [Slots] line at startup —
+  # read it there, not here.
   #
   # a and server.batch-size MUST be identical in every machine's config.yaml:
   # both feed queue arguments, and a queue_declare with different arguments is a

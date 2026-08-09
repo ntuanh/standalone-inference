@@ -38,12 +38,6 @@ class RpcClient:
             num_layers = self.response["num_layers"]
             splits = self.response["splits"]
             queue_name = self.response.get("queue_name", "intermediate_queue")
-            # queue_name stays the CLUSTER identity (metrics files, FPS pings).
-            # work_queue is the raw-frame queue this cloud consumes; work_queues
-            # are the ones an edge may publish to, one per cloud — see
-            # Utils.cloud_work_queue for why they are per-cloud.
-            work_queue = self.response.get("work_queue", queue_name)
-            work_queues = self.response.get("work_queues", [queue_name])
             batch_size = self.response["batch_size"]
             model = self.response["model"]
             data = self.response["data"]
@@ -93,8 +87,7 @@ class RpcClient:
 
             Log.print_with_color(f"Start Inference", "green")
 
-            self.inference_func(client, data, num_layers, splits, batch_size, self.logger, compress, mode, queue_name, save_set,
-                                work_queue=work_queue, work_queues=work_queues)
+            self.inference_func(client, data, num_layers, splits, batch_size, self.logger, compress, mode, queue_name, save_set)
 
             return False
         else:

@@ -10,7 +10,8 @@ import src.Model
 import src.Log
 import src.Results
 from src.Utils import (get_intermediate_queue_args, get_bbox_queue_args,
-                       get_publish_slots, get_slot_queue_args)
+                       get_publish_slots, get_slot_queue_args,
+                       raw_frame_transport_plan, describe_transport_plan)
 from ultralytics import YOLO
 
 from src.Clustering import (
@@ -185,13 +186,9 @@ class Server:
         self.batch_log_path = self.result_files["batch"]
         self.utilization_log_path = self.result_files["util"]
         self.logger = src.Log.Logger(f"{log_path}/app.log", config["debug-mode"])
-        if self.publish_slots:
-            src.Log.print_with_color(
-                f"[Slots] {self.publish_slots} raw-frame publish permits "
-                f"-> at most {self.publish_slots} batches in the broker at once", "cyan")
-        else:
-            src.Log.print_with_color(
-                "[Slots] disabled (no rabbit.max-queue-messages) — broker memory is unbounded", "yellow")
+        plan = raw_frame_transport_plan(config)
+        src.Log.print_with_color(describe_transport_plan(plan),
+                                 "cyan" if plan["permits"] > 0 else "yellow")
         self.logger.log_info(f"Application start. Server is waiting for {self.total_clients} clients.")
         src.Log.print_with_color(f"Application start. Server is waiting for {self.total_clients} clients.", "green")
 

@@ -2,7 +2,8 @@ import argparse
 import sys
 import signal
 from src.Server import Server
-from src.Utils import delete_old_queues
+from src.Utils import (delete_old_queues, acquire_server_lock,
+                       validate_transport_config)
 import src.Log
 import yaml
 
@@ -26,6 +27,24 @@ def signal_handler(sig, frame):
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
+
+    # Both checks run before delete_old_queues, which is destructive: it deletes
+    # intermediate_queue / slot_queue / rpc_queue, so bailing out after it would
+    # already have wrecked a run in progress.
+    try:
+        validate_transport_config(config)   # Server.__init__ prints the plan
+    except RuntimeError as e:
+        src.Log.print_with_color(f"[!] Broker RAM budget: {e}", "red")
+        sys.exit(1)
+
+    try:
+        # Held for the whole process lifetime — dropping this reference releases
+        # the lock and lets a second server in.
+        server_lock = acquire_server_lock(address, username, password, virtual_host)
+    except RuntimeError as e:
+        src.Log.print_with_color(f"[!] {e}", "red")
+        sys.exit(1)
+
     delete_old_queues(address, username, password, virtual_host)
     server = Server(config)
     server.start()

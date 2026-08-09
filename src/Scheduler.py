@@ -18,8 +18,9 @@ from src.Utils import (get_intermediate_queue_args, get_bbox_queue_args,
                        get_publish_slots, get_slot_queue_args)
 
 # Raw-frame batches (~150 MB/msg in only_cloud and on adaptive's split route)
-# are bounded by the slot_queue permit pool, sized from rabbit.max-queue-messages
-# — see Utils.get_publish_slots and Scheduler._acquire_slot. The depth-poll this
+# are bounded by the slot_queue permit pool, sized from the broker RAM budget in
+# rabbit.broker-ram-budget-mb — see Utils.raw_frame_transport_plan,
+# Utils.get_publish_slots and Scheduler._acquire_slot. The depth-poll this
 # replaced could not bound broker memory: a message is invisible to the queue's
 # message_count until the broker has received all of it, so every edge polling
 # during a multi-second upload read an empty queue and transmitted anyway.

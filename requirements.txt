@@ -9,3 +9,19 @@ ultralytics==8.4.23
 scipy
 psutil
 tqdm
+
+# Optional — broker-host RAM sampling over SSH (guide/11-broker-ram.md). Without
+# it the sampler falls back to the RabbitMQ management API, which reports the
+# BROKER PROCESS rather than the host; every line carries source= so the two are
+# never confused. Absent entirely, the feature degrades to a samples=0 line
+# naming the reason and the run is unaffected.
+paramiko
+
+# Optional — building and executing the visualization notebook
+# (guide/08-build-pipeline.md): python tools/build_nb.py && python tools/run_nb.py
+# nbconvert is deliberately NOT required.
+nbformat
+nbclient
+ipykernel
+matplotlib
+pandas

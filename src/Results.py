@@ -201,6 +201,249 @@ def latency_lines(ts_ns, reports):
 
 
 # --------------------------------------------------------------------------
+# free_time.log / free_time_cluster.log / free_time_series.log  (01 §3.8-3.10, 10)
+# --------------------------------------------------------------------------
+
+def _fmt_pct(x):
+    return f"{x * 100:.2f}%"
+
+
+def free_time_lines(ts_ns, reports):
+    """One line per device. `busy_s` is the MERGED busy time across every lane,
+    never a sum of per-stage timers — a sum can exceed the span outright on a
+    pipelined device, and it also misses the gaps between stages, which is
+    precisely where free time lives (10 §1).
+
+    `busy_s + free_s == span_s` exactly, and `free` and `utilization` measure
+    different things and must NOT be expected to sum to 100%."""
+    lines = []
+    for r in sorted(reports or [], key=lambda x: (str(x.get("machine")), str(x.get("role")))):
+        span_ns = float(r.get("span_ns") or 0)
+        if span_ns <= 0:
+            continue
+        free_ns = float(r.get("free_ns") or 0)
+        line = (f"{ts_ns} client={r.get('client_name')} role={r.get('role')} "
+                f"machine={r.get('machine')} cluster={r.get('cluster')} "
+                f"device={r.get('device') or 'unknown'} "
+                f"span_s={span_ns / 1e9:.3f} busy_s={float(r.get('busy_ns') or 0) / 1e9:.3f} "
+                f"free_s={free_ns / 1e9:.3f} free={_fmt_pct(free_ns / span_ns)} "
+                f"gaps={r.get('gaps', 0)} "
+                f"longest_free_ms={float(r.get('longest_free_ns') or 0) / 1e6:.3f}")
+        if r.get("host_idle") is not None:
+            line += f" host_idle={_fmt_pct(float(r['host_idle']))}"
+        lines.append(line)
+    return lines
+
+
+def _free_pooled(reports):
+    free = sum(float(r.get("free_ns") or 0) for r in reports)
+    span = sum(float(r.get("span_ns") or 0) for r in reports)
+    return (free / span if span else 0.0), free, span
+
+
+def _free_mean(reports):
+    vals = [float(r["free_ns"]) / float(r["span_ns"])
+            for r in reports if float(r.get("span_ns") or 0) > 0]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def _reason_lines(ts_ns, scope_prefix, reports):
+    """`FREE reason=` shares MUST sum to 100% of that scope's free time. Each
+    device already attributed its own free time in the published priority order
+    (src/FreeTime.FREE_REASON_PRIORITY), so nothing is claimed twice and whatever
+    no reason covered arrived as `unaccounted` rather than being dropped —
+    summing them here therefore cannot leak."""
+    totals = {}
+    for r in reports:
+        for reason, ns in (r.get("reasons") or {}).items():
+            totals[reason] = totals.get(reason, 0.0) + float(ns)
+    grand = sum(totals.values())
+    if grand <= 0:
+        return []
+    return [f"{ts_ns} {scope_prefix}FREE reason={reason} free_s={ns / 1e9:.3f} "
+            f"share={ns / grand * 100:.2f}%"
+            for reason, ns in sorted(totals.items(), key=lambda kv: -kv[1])]
+
+
+def _kind_lines(ts_ns, scope_prefix, reports):
+    """`KIND` shares MAY sum to more than 100%: per-kind sums overlap across
+    lanes by construction. Only the merged `busy_s` is exclusive, and that is the
+    point — if these agree with it on a pipelined worker, the merge is silently a
+    sum (10 §7)."""
+    totals, span = {}, sum(float(r.get("span_ns") or 0) for r in reports)
+    for r in reports:
+        for kind, ns in (r.get("kinds") or {}).items():
+            totals[kind] = totals.get(kind, 0.0) + float(ns)
+    if not totals or span <= 0:
+        return []
+    return [f"{ts_ns} {scope_prefix}KIND kind={kind} busy_s={ns / 1e9:.3f} "
+            f"share={ns / span * 100:.2f}%"
+            for kind, ns in sorted(totals.items(), key=lambda kv: -kv[1])]
+
+
+def _machine_lines(ts_ns, reports):
+    """One line per host, from the UNION of the busy intervals of the device
+    processes on it — never from their ratios. Two devices that are each 50% free
+    can keep a machine 100% busy by interleaving, so averaging their percentages
+    answers a different question than the one asked.
+
+    This is the ONE place intervals from different processes are compared, and it
+    is valid for exactly one reason: they share a clock. Intervals are never
+    unioned across machines."""
+    from src.FreeTime import merge_intervals
+
+    by_machine = _group_by(reports, lambda r: r.get("machine") or "unknown")
+    lines = []
+    for machine in sorted(by_machine):
+        devs = by_machine[machine]
+        starts = [int(d["start_epoch_ns"]) for d in devs if d.get("start_epoch_ns")]
+        ends = [int(d["end_epoch_ns"]) for d in devs if d.get("end_epoch_ns")]
+        if not starts or not ends:
+            continue
+        lo, hi = min(starts), max(ends)
+        span_ns = hi - lo
+        if span_ns <= 0:
+            continue
+        busy = merge_intervals([list(iv) for d in devs
+                                for iv in (d.get("intervals_epoch_ns") or [])])
+        busy_ns = sum(min(e, hi) - max(s, lo) for s, e in busy
+                      if min(e, hi) > max(s, lo))
+        free_ns = max(0, span_ns - busy_ns)
+        idles = [float(d["host_idle"]) for d in devs if d.get("host_idle") is not None]
+        line = (f"{ts_ns} MACHINE machine={machine} devices={len(devs)} "
+                f"free={_fmt_pct(free_ns / span_ns)} free_s={free_ns / 1e9:.3f} "
+                f"span_s={span_ns / 1e9:.3f} "
+                f"merge_slop_s={sum(float(d.get('merge_slop_ns') or 0) for d in devs) / 1e9:.3f}")
+        if idles:
+            line += f" host_idle={_fmt_pct(sum(idles) / len(idles))}"
+        lines.append(line)
+    return lines
+
+
+def free_time_rollup_lines(ts_ns, reports):
+    """free_time_cluster.log — six line kinds in one file: cluster total (`ALL`),
+    cluster x role, free breakdown (`FREE`), busy breakdown (`KIND`), per-machine
+    (`MACHINE`), and `SYSTEM`.
+
+    Read them in this order: SYSTEM free (how much of the fleet was idle at all),
+    then MACHINE (whether the idleness is concentrated on specific hosts), then
+    FREE reason (starvation vs congestion vs overhead), and only then the
+    per-device lines (10 §6)."""
+    lines = []
+    reports = [r for r in (reports or []) if float(r.get("span_ns") or 0) > 0]
+    if not reports:
+        return lines
+
+    by_cluster = _group_by(reports, lambda r: r.get("cluster", "unknown"))
+    for cluster in sorted(by_cluster, key=str):
+        devs = by_cluster[cluster]
+        pooled, free, span = _free_pooled(devs)
+        lines.append(f"{ts_ns} cluster={cluster} ALL devices={len(devs)} "
+                     f"free={_fmt_pct(pooled)} free_mean={_fmt_pct(_free_mean(devs))} "
+                     f"free_s={free / 1e9:.3f} span_s={span / 1e9:.3f}")
+        by_role = _group_by(devs, lambda r: r.get("role", "unknown"))
+        for role in sorted(by_role, key=str):
+            rdevs = by_role[role]
+            pooled, free, span = _free_pooled(rdevs)
+            lines.append(f"{ts_ns} cluster={cluster} role={role} devices={len(rdevs)} "
+                         f"free={_fmt_pct(pooled)} "
+                         f"free_mean={_fmt_pct(_free_mean(rdevs))} "
+                         f"free_s={free / 1e9:.3f} span_s={span / 1e9:.3f}")
+        lines += _reason_lines(ts_ns, f"cluster={cluster} ", devs)
+        lines += _kind_lines(ts_ns, f"cluster={cluster} ", devs)
+
+    lines += _machine_lines(ts_ns, reports)
+
+    pooled, free, span = _free_pooled(reports)
+    machines = len(set(r.get("machine") or "unknown" for r in reports))
+    lines.append(f"{ts_ns} SYSTEM devices={len(reports)} clusters={len(by_cluster)} "
+                 f"machines={machines} free={_fmt_pct(pooled)} "
+                 f"free_mean={_fmt_pct(_free_mean(reports))} "
+                 f"free_s={free / 1e9:.3f} span_s={span / 1e9:.3f}")
+    return lines
+
+
+def free_time_series_lines(ts_ns, reports):
+    """One line per device per time bucket — the plottable 'when was each device
+    idle' series. Read it against batch_done_ns.log on the same axis: a band of
+    free time on one device that lines up with a throughput dip names the stage
+    that stalled.
+
+    The leading timestamp is the report's server-clock ARRIVAL; the position in
+    the run is `t_offset_s`, on the DEVICE's clock. Devices start at different
+    moments, so their offsets are not directly comparable — do not conflate the
+    two (01 §3.10). `bucket_s` rides on every line rather than being assumed, so a
+    long run may widen its buckets without breaking a reader."""
+    lines = []
+    for r in sorted(reports or [], key=lambda x: (str(x.get("machine")), str(x.get("role")))):
+        bucket_s = float(r.get("bucket_s") or 1.0)
+        for i, free in enumerate(r.get("series") or []):
+            lines.append(
+                f"{ts_ns} client={r.get('client_name')} role={r.get('role')} "
+                f"machine={r.get('machine')} cluster={r.get('cluster')} "
+                f"i={i} t_offset_s={i * bucket_s:.3f} bucket_s={bucket_s:.3f} "
+                f"free={_fmt_pct(max(0.0, min(1.0, float(free))))}")
+    return lines
+
+
+# --------------------------------------------------------------------------
+# message_size.log / message_size_series.log  (01 §3.11-3.12, 12)
+# --------------------------------------------------------------------------
+
+# MB = 10^6, matching broker_ram.log, so a payload size and the broker host's
+# memory growth compare without a unit conversion in between (12 §4).
+_SIZE_MB = 1e6
+
+
+def message_size_lines(ts_ns, reports, batch_size):
+    """(summary_lines, series_lines) for the two message-size files.
+
+    Normally exactly one report: the payload shape is fixed by the configuration,
+    so every edge in a cluster publishes the same size and measuring all nine
+    produces one number nine times at nine times the cost (12 §1).
+
+    Both `bytes` and `mb` go on every series line on purpose — `bytes` is the
+    authoritative integer, `mb` keeps the file readable, and a reader that rounds
+    its own MB from `bytes` still agrees with the summary."""
+    summary, series = [], []
+    for r in reports or []:
+        n = int(r.get("n") or 0)
+        if not n:
+            continue
+        ctx = r.get("context") or {}
+        span_s = float(r.get("span_s") or 0.0)
+        total_mb = float(r.get("total_bytes", 0)) / _SIZE_MB
+        mean_mb = float(r.get("mean_bytes", 0)) / _SIZE_MB
+        # The context keys are not decoration: a size without the compression
+        # setting, the split point, the mode and the unit size cannot be
+        # reproduced, and the same run re-read a month later reads as noise.
+        ctx_str = " ".join(f"{k}={v}" for k, v in ctx.items() if v is not None)
+        summary.append(
+            f"{ts_ns} client={r.get('client_name')} role={r.get('role')} "
+            f"machine={r.get('machine')} cluster={r.get('cluster')} "
+            + (ctx_str + " " if ctx_str else "") +
+            f"n={n} total_mb={total_mb:.3f} mean_mb={mean_mb:.3f} "
+            f"p50_mb={float(r.get('p50_bytes', 0)) / _SIZE_MB:.3f} "
+            f"p95_mb={float(r.get('p95_bytes', 0)) / _SIZE_MB:.3f} "
+            f"max_mb={float(r.get('max_bytes', 0)) / _SIZE_MB:.3f} "
+            f"min_mb={float(r.get('min_bytes', 0)) / _SIZE_MB:.3f} "
+            f"span_s={span_s:.3f} "
+            f"rate_mb_s={(total_mb / span_s if span_s > 0 else 0.0):.3f} "
+            f"per_frame_mb={(mean_mb / batch_size if batch_size else 0.0):.4f}")
+
+        for i, offset_s, batch_id, n_bytes in r.get("series") or []:
+            # The leading timestamp is the SERVER's clock (the report's arrival);
+            # the position in the run is t_offset_s on the WORKER's clock. Never
+            # conflate them — that split is what keeps a device timestamp out of
+            # a shared file (01 §3.12).
+            series.append(
+                f"{ts_ns} client={r.get('client_name')} cluster={r.get('cluster')} "
+                f"i={i} t_offset_s={float(offset_s):.3f} batch_id={batch_id} "
+                f"bytes={int(n_bytes)} mb={int(n_bytes) / _SIZE_MB:.3f}")
+    return summary, series
+
+
+# --------------------------------------------------------------------------
 # archiving  (05)
 # --------------------------------------------------------------------------
 

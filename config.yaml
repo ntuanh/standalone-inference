@@ -88,6 +88,46 @@ log-path: .
 fps:                      # optional; defaults shown
   grace_s: 10             # keep collecting DONEs this long after the work queues drain
   shutdown_timeout_s: 300 # hard cap so a dead worker can't hang the server
+
+# ---- optional measurements (guide/10, 11, 12) ---------------------------------
+# Every flag below lives ONLY here, in the server's config, and travels to the
+# workers inside the START message. No client reads any of them from its own
+# config.yaml — otherwise a measurement setting would have to be changed on 12
+# machines, the copies would drift, and one run would silently mix two
+# configurations. Turning a flag off also skips the server's own shutdown
+# collector for it, so shutdown never burns a timeout polling a queue nobody will
+# publish to. The result files still exist, empty, when a feature is off.
+
+free-time:                # guide/10 — how much of each device and machine was idle
+  enable: True
+  bucket_s: 1.0           # width of one free_time_series.log bucket; widened
+                          # automatically on a long run so the series still spans it
+
+message-size:             # guide/12 — bytes ONE worker puts on the wire
+  enable: True
+  max_series: 2000        # cap on the SHIPPED series; decimated evenly, never
+                          # truncated. Summary stats always use every sample.
+
+broker-ram:               # guide/11 — RAM of the RabbitMQ host, which runs no code
+  enable: False           # of ours, so it is pulled from outside over SSH
+  # host: defaults to rabbit.address
+  interval_s: 1.0
+  tail_s: 2.0             # keep sampling this long past the drain: that is when a
+                          # backed-up host gives memory back, and a curve that does
+                          # not fall there means something is still holding units
+  max_run_s: 7200         # bounds the REMOTE loop, so a sampler orphaned by a hard
+                          # kill of the server cannot outlive the run
+  api_fallback: True      # management API if SSH is unavailable. It reports the
+                          # BROKER PROCESS, not the host — a different quantity, so
+                          # every line carries source= and it is never substituted
+                          # silently
+  ssh:
+    # HOST login, NOT the rabbit application credentials above. Confusing the two
+    # produces an authentication failure that looks like a network problem.
+    username:
+    password:
+    # key_file: ~/.ssh/id_rsa
+    port: 22
 compress:
   enable: False
   num_bit: 8

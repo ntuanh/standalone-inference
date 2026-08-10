@@ -87,7 +87,14 @@ class RpcClient:
 
             Log.print_with_color(f"Start Inference", "green")
 
-            self.inference_func(client, data, num_layers, splits, batch_size, self.logger, compress, mode, queue_name, save_set)
+            # The whole dispatch message goes through, not just the fields this
+            # function unpacks: every runtime setting reaches a worker from here
+            # and a worker reads NOTHING measurement-related from its own
+            # config.yaml (guide/README invariant 9). Passing the dict means a new
+            # flag costs one line in Server.notify_clients and none here.
+            self.inference_func(client, data, num_layers, splits, batch_size,
+                                self.logger, compress, mode, queue_name, save_set,
+                                dispatch=self.response)
 
             return False
         else:

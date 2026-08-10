@@ -14,6 +14,8 @@ import pika.exceptions
 
 from src.Compress import Encoder,Decoder
 import src.Log as Log
+from src.FreeTime import FreeTimeTracker
+from src.MessageSize import MessageSizeRecorder
 from src.Model import inference, postprocess_yolo
 from src.Utils import (get_intermediate_queue_args, get_bbox_queue_args,
                        get_publish_slots, get_slot_queue_args, transport_plan,
@@ -32,11 +34,16 @@ from src.Utils import (get_intermediate_queue_args, get_bbox_queue_args,
 
 
 class Scheduler:
-    def __init__(self, client_id, layer_id, channel, device):
+    def __init__(self, client_id, layer_id, channel, device, name=None):
         self.client_id = client_id
         self.layer_id = layer_id
         self.channel = channel
         self.device = device
+        # --name from the command line. It is how a device is identified in
+        # free_time_cluster.log's MACHINE lines and in message_size.log, so two
+        # processes on one host must share it — that shared name is precisely
+        # what tells the server their busy intervals may be unioned (guide/10 §4).
+        self._client_name = name
 
         cid_short = str(client_id).replace('-', '')[:12]
         # Also the chunk label prefix: batch ids restart at 0 on every edge, so
@@ -116,6 +123,15 @@ class Scheduler:
         # broker NACK a publish that hit the reject-publish overflow ceiling, so
         # _publish_intermediate can wait+retry instead of silently dropping it.
         self._confirms_enabled = False
+
+        # Optional measurements (guide 10 and 12). Both are replaced in
+        # _apply_dispatch with the settings the SERVER sent; these inert defaults
+        # only cover the window between construction and dispatch, so no code path
+        # has to test whether they exist yet.
+        self._msize = MessageSizeRecorder(False, client_id, self._client_name,
+                                          "edge" if layer_id == 1 else "cloud", None)
+        self._free = FreeTimeTracker(False, client_id, self._client_name,
+                                     "edge" if layer_id == 1 else "cloud", None)
 
         self.map_metric = None
         self.gt_dict = {}
@@ -214,25 +230,46 @@ class Scheduler:
                 Log.print_with_color(f"[Reconnect] Retry in 1s ({e})", "yellow")
                 time.sleep(1.0)
 
-    def _take_token(self, queue, timeout_s=None):
+    def _take_token(self, queue, timeout_s=None, free_reason="backpressure"):
         """Take the single token out of a lock queue; True once this device holds
         it. Shared by the permit pool and the two exclusivity locks — they are the
         same primitive, a message you must hold to proceed.
 
         timeout_s=None blocks until the token frees up; 0.0 tries once and gives
         up, which is what lets adaptive fall straight through to local inference.
+
+        Free-time classification happens RETROACTIVELY (guide/10 §2), because this
+        call is only classifiable once it returns: a token taken on the first
+        attempt is one broker round trip, which is work, while a call that had to
+        loop was a stall, which is free. Guessing up front gets it wrong every
+        time the pool runs dry — which is the case the measurement is for.
         """
+        t_enter = self._free.now()
         deadline = None if timeout_s is None else time.time() + timeout_s
+        looped = False
         while True:
             try:
                 method_frame, _, _ = self.channel.basic_get(queue=queue, auto_ack=True)
                 if method_frame:
+                    if looped:
+                        self._free.add_wait(free_reason, t_enter)
+                    else:
+                        self._free.add_work("broker", t_enter)
                     return True
             except self._CONN_ERRORS:
                 self._reconnect()
+                looped = True
                 continue
             if deadline is not None and time.time() >= deadline:
+                # A zero-timeout miss is still a broker round trip, not a stall:
+                # the caller falls straight through to local inference and is
+                # about to be busy. Only a call that actually waited is free.
+                if looped:
+                    self._free.add_wait(free_reason, t_enter)
+                else:
+                    self._free.add_work("broker", t_enter)
                 return False
+            looped = True
             try:
                 self.channel.connection.sleep(0.02)
             except Exception:
@@ -349,7 +386,8 @@ class Scheduler:
                 self._publish_intermediate(
                     queue_name, body,
                     properties=pika.BasicProperties(headers={
-                        "batch_key": key, "chunk_index": index, "chunk_total": total}))
+                        "batch_key": key, "chunk_index": index, "chunk_total": total}),
+                    batch_id=batch_id)
             self.size_message = size
         finally:
             # Must come back even if a publish threw, or the whole edge tier
@@ -496,7 +534,7 @@ class Scheduler:
             f"[Send][{self._cid_short}] {queue_name}  {n_bytes / (1024 * 1024):.2f} MiB "
             f"({n_bytes} B){label}", "blue")
 
-    def _publish_intermediate(self, queue_name, body, properties=None):
+    def _publish_intermediate(self, queue_name, body, properties=None, batch_id=None):
         """Publish one batch to intermediate_queue with broker overflow handling.
 
         With publisher confirms on and the queue declared 'x-overflow:
@@ -513,6 +551,17 @@ class Scheduler:
         reports the on-the-wire size of all of them. Logged AFTER the publish
         returns, so a NACKed attempt that gets retried is reported once, at the
         size that actually landed, not once per attempt."""
+        # The payload-size sample goes down BEFORE the publish and OUTSIDE the
+        # retry loop (guide/12 §2). Before, because a broker at its high-water
+        # mark blocks rather than fails, and that stall is exactly the run this
+        # measurement exists to explain — measuring after the call writes that
+        # sample late, or never. Outside, because a NACKed-then-retried body is
+        # one message on the wire, not two. Only intermediate_queue bodies are
+        # sampled: bbox_queue carries ~KB of text on a different route, and
+        # pooling the two would make every percentile bimodal. Inert unless the
+        # server picked this worker.
+        if queue_name == self.intermediate_queue:
+            self._msize.record(len(body), batch_id)
         while True:
             try:
                 self.channel.basic_publish(exchange='', routing_key=queue_name,
@@ -587,7 +636,7 @@ class Scheduler:
             Log.print_with_color(f"[Metrics] Fanout setup failed: {e}", "yellow")
             self._my_metrics_queue = None
 
-    def send_next_layer(self, intermediate_queue, data, compress):
+    def send_next_layer(self, intermediate_queue, data, compress, batch_id=None):
 
         if compress["enable"]:
             data["data"] = [t.cpu().numpy() if isinstance(t, torch.Tensor) else None for t in
@@ -603,7 +652,7 @@ class Scheduler:
         })
         self.size_message = len(message)
 
-        self._publish_intermediate(intermediate_queue, message)
+        self._publish_intermediate(intermediate_queue, message, batch_id=batch_id)
 
     def _load_gt_dict(self, gt_dir="datasets/groundtruth"):
         if not os.path.isdir(gt_dir):
@@ -804,6 +853,66 @@ class Scheduler:
                 return
         Log.print_with_color("[Utilization] send failed after reconnect", "yellow")
 
+    def _publish_report(self, queue, body, label):
+        """Park one shutdown report on a dedicated measurement queue.
+
+        Publisher and consumer never need to be alive at the same moment: this
+        device finishes long before the server's shutdown collection runs, and the
+        broker holds the message across the gap (03 §4). One reconnect attempt,
+        then a warning — telemetry never kills the run."""
+        for attempt in range(2):
+            try:
+                self.channel.queue_declare(queue, durable=False)
+                self.channel.basic_publish(exchange='', routing_key=queue, body=body)
+                return True
+            except self._CONN_ERRORS:
+                if attempt == 0:
+                    self._reconnect()
+            except Exception as e:
+                Log.print_with_color(f"[{label}] send failed: {e}", "yellow")
+                return False
+        Log.print_with_color(f"[{label}] send failed after reconnect", "yellow")
+        return False
+
+    def _send_message_size(self):
+        """Ship this worker's payload-size report (guide/12 §3). Returns without
+        touching the broker on the eight workers the server did not pick, and on
+        a picked worker that published nothing."""
+        report = self._msize.report()
+        if report is None:
+            return
+        if self._publish_report("message_size_queue", pickle.dumps(report), "MsgSize"):
+            Log.print_with_color(
+                f"[MsgSize] reported {report['n']} messages, "
+                f"{report['total_bytes'] / 1e6:.1f} MB total "
+                f"(mean {report['mean_bytes'] / 1e6:.2f} MB)", "green")
+
+    def _send_free_time(self):
+        """Ship this device's free-time report (guide/10 §3). The merged busy
+        intervals travel with it so the server can union the device processes
+        that share a machine — the one place intervals from different processes
+        are compared, and safe only because they share a clock."""
+        report = self._free.report()
+        if report is None:
+            return
+        if self._publish_report("free_time_queue", pickle.dumps(report), "FreeTime"):
+            Log.print_with_color(
+                f"[FreeTime] reported span={report['span_ns'] / 1e9:.1f}s "
+                f"busy={report['busy_ns'] / 1e9:.1f}s "
+                f"free={report['free_ns'] / 1e9:.1f}s "
+                f"({report['free_ns'] / report['span_ns'] * 100:.2f}%)", "green")
+
+    def _send_shutdown_reports(self, timing_log, role):
+        """Every whole-run report this device owes the server, in one place.
+
+        Order matters only in that utilization goes first: it is the required
+        file, and if the connection dies mid-shutdown the run should lose the
+        optional measurements rather than the mandatory one."""
+        self._free.finish()
+        self._send_utilization(self._compute_utilization(timing_log, role))
+        self._send_free_time()
+        self._send_message_size()
+
     def send_to_server(self, message):
         self.channel.queue_declare('rpc_queue', durable=False)
         self.channel.basic_publish(exchange='',
@@ -834,7 +943,15 @@ class Scheduler:
         batch_first_frame_ns = None
         with open(self._timing_log_edge, "w") as _tf:
             print(str(time.time_ns()) + " start", file=_tf)
+        # Loading the model and opening the source is work, done before the first
+        # unit exists. Left out, it would land in `unaccounted` free time and this
+        # device would look idle during the one stretch it was busiest.
+        self._free.add_work("startup", self._free.start_ns)
         while True:
+            # Reading and preprocessing a frame is real work, and it is the lane
+            # that keeps this device busy between batches — free time that ignored
+            # it would report the edge as idle for most of the run (guide/10 §1).
+            _ft_cap = self._free.now()
             ret, frame = cap.read()
             if not ret:
                 break
@@ -847,6 +964,7 @@ class Scheduler:
                 # the rest of the batch is captured.
                 batch_first_frame_ns = time.time_ns()
             input_image.append(tensor)
+            self._free.add_work("capture", _ft_cap)
 
             if len(input_image) == batch_size:
                 t_batch_ready = time.perf_counter()
@@ -897,23 +1015,28 @@ class Scheduler:
                     queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
 
                     _send_start = time.perf_counter()
+                    _ft_send = self._free.now()
                     self._send_frames(self.intermediate_queue, y, batch_id)
                     send_ms = (time.perf_counter() - _send_start) * 1000
+                    self._free.add_work("send", _ft_send)
 
                 # ===== ONLY EDGE =====
                 elif mode == "only_edge":
 
                     _inf_start = time.perf_counter()
+                    _ft_inf = self._free.now()
                     y = []
                     with torch.no_grad():
                         x, y = inference(model, input_image, y, 0, save_set)
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
+                    self._free.add_work("inference", _ft_inf)
 
                     results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
                     map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
                     self._update_map(results, batch_id, batch_size, map_results=map_results)
 
                     _send_start = time.perf_counter()
+                    _ft_send = self._free.now()
                     payload = {
                         "width": width,
                         "height": height,
@@ -929,8 +1052,10 @@ class Scheduler:
                     }
                     body = pickle.dumps({"action": "OUTPUT", "data": payload})
                     self.size_message = len(body)
-                    self._publish_intermediate(self.intermediate_queue, body)
+                    self._publish_intermediate(self.intermediate_queue, body,
+                                               batch_id=batch_id)
                     send_ms = (time.perf_counter() - _send_start) * 1000
+                    self._free.add_work("send", _ft_send)
 
                 # ===== ADAPTIVE (full cloud  OR  full edge, decided per batch) =====
                 elif mode == "adaptive":
@@ -964,23 +1089,28 @@ class Scheduler:
                         # the first chunk needs no wait; later chunks, if a < 1,
                         # wait inside _send_frames.
                         _send_start = time.perf_counter()
+                        _ft_send = self._free.now()
                         self._send_frames(self.intermediate_queue, y, batch_id)
                         send_ms = (time.perf_counter() - _send_start) * 1000
+                        self._free.add_work("send", _ft_send)
                     else:
                         # --- Cloud backlogged → run full YOLO locally, ship bboxes ---
                         input_image = input_image.to(self.device)
 
                         _inf_start = time.perf_counter()
+                        _ft_inf = self._free.now()
                         y = []
                         with torch.no_grad():
                             x, y = inference(model, input_image, y, 0, save_set)
                         inference_ms = (time.perf_counter() - _inf_start) * 1000
+                        self._free.add_work("inference", _ft_inf)
 
                         results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
                         map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
                         self._update_map(results, batch_id, batch_size, map_results=map_results)
 
                         _send_start = time.perf_counter()
+                        _ft_send = self._free.now()
                         payload = {
                             "width": width,
                             "height": height,
@@ -998,16 +1128,19 @@ class Scheduler:
                         self.size_message = len(body)
                         self._publish_intermediate(self.bbox_queue, body)
                         send_ms = (time.perf_counter() - _send_start) * 1000
+                        self._free.add_work("send", _ft_send)
 
                 # ===== SPLIT INFERENCE =====
                 else:
 
                     _inf_start = time.perf_counter()
+                    _ft_inf = self._free.now()
                     y = []
                     with torch.no_grad():
                         x, y = inference(model, input_image, y, 0, save_set)
                     y[-1] = x
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
+                    self._free.add_work("inference", _ft_inf)
 
                     y = {
                         "data": y,
@@ -1017,10 +1150,12 @@ class Scheduler:
                     }
 
                     _send_start = time.perf_counter()
+                    _ft_send = self._free.now()
                     self.send_next_layer(
-                        self.intermediate_queue,y,compress
+                        self.intermediate_queue, y, compress, batch_id=batch_id
                     )
                     send_ms = (time.perf_counter() - _send_start) * 1000
+                    self._free.add_work("send", _ft_send)
                 batch_end = time.perf_counter()
                 t_output_ns = time.time_ns()
                 with open(self._timing_log_edge, "a") as _tf:
@@ -1048,6 +1183,7 @@ class Scheduler:
                 if edge_completes:
                     self._e2e_ms.append(e2e_latency_ms)
                 _ram_start = time.perf_counter()
+                _ft_meta = self._free.now()
                 ram_mb = self.get_ram_mb()
                 ram_ms = (time.perf_counter() - _ram_start) * 1000
                 msg_size = self.size_message if self.size_message is not None else 0
@@ -1076,6 +1212,9 @@ class Scheduler:
                     inference_path=route_path or "",
                 )
                 write_ms = (time.perf_counter() - _write_start) * 1000
+                # Bookkeeping counts as busy: free time is the wall clock in which
+                # the device did NOTHING AT ALL (guide/10, opening definition).
+                self._free.add_work("metrics", _ft_meta)
 
                 # Completion ping → fps_queue when the EDGE is the tier that
                 # completed this batch (only_edge, or adaptive routed edge_only).
@@ -1103,7 +1242,7 @@ class Scheduler:
                 continue
         with open(self._timing_log_edge, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
-        self._send_utilization(self._compute_utilization(self._timing_log_edge, "edge"))
+        self._send_shutdown_reports(self._timing_log_edge, "edge")
         print(f'size message: {self.size_message} bytes.')
         cap.release()
         pbar.close()
@@ -1153,7 +1292,16 @@ class Scheduler:
         prev_batch_end = None
         with open(self._timing_log_cloud, "w") as _tf:
             print(str(time.time_ns()) + " start", file=_tf)
+        # Loading the model and opening the source is work, done before the first
+        # unit exists. Left out, it would land in `unaccounted` free time and this
+        # device would look idle during the one stretch it was busiest.
+        self._free.add_work("startup", self._free.start_ns)
         while True:
+            # A fetch is only classifiable after it returns (guide/10 §2): work
+            # when it yields a batch, free when the queue was empty. This is the
+            # cloud's dominant free-time source — it is starved, not stalled — so
+            # the reason is 'input'.
+            _ft_fetch = self._free.now()
             try:
                 # One complete batch, however many messages carried it. Returns
                 # only when a batch is whole, so the timers below always bracket a
@@ -1165,8 +1313,10 @@ class Scheduler:
                 # Connection dropped (e.g. during the previous long inference) —
                 # reconnect and retry the get on the next loop iteration.
                 self._reconnect()
+                self._free.add_wait("downstream", _ft_fetch)
                 continue
             if fetched:
+                self._free.add_work("recv", _ft_fetch)
                 # Permits were already handed back inside _fetch_batch, which owns
                 # all of that accounting.
                 bodies, src_queue = fetched
@@ -1211,6 +1361,7 @@ class Scheduler:
                 # ===== ONLY CLOUD =====
                 elif eff == "only_cloud":
                     _decode_start = time.perf_counter()
+                    _ft_decode = self._free.now()
                     input_tensor = y["data"]
 
                     if isinstance(input_tensor, list):
@@ -1218,14 +1369,18 @@ class Scheduler:
 
                     input_tensor = input_tensor.to(self.device)
                     decode_ms = (time.perf_counter() - _decode_start) * 1000
+                    self._free.add_work("decode", _ft_decode)
 
                     _inf_start = time.perf_counter()
+                    _ft_inf = self._free.now()
                     with torch.no_grad():
                         x, _ = inference(model, input_tensor, [], 0, save_set)
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
+                    self._free.add_work("inference", _ft_inf)
                 # ===== SPLIT INFERENCE =====
                 else:
                     _decode_start = time.perf_counter()
+                    _ft_decode = self._free.now()
                     if compress["enable"]:
                         y["data"] = Decoder(y["data"], y["shape"])
 
@@ -1243,20 +1398,25 @@ class Scheduler:
 
                     x = list_output[-1]
                     decode_ms = (time.perf_counter() - _decode_start) * 1000
+                    self._free.add_work("decode", _ft_decode)
 
                     _inf_start = time.perf_counter()
+                    _ft_inf = self._free.now()
                     with torch.no_grad():
                         x, _ = inference(model, x, list_output, splits, save_set)
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
+                    self._free.add_work("inference", _ft_inf)
 
                 if eff == "only_edge":
                     postprocess_ms = 0.0
                 else:
                     _post_start = time.perf_counter()
+                    _ft_post = self._free.now()
                     results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
                     map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
                     self._update_map(results, batch_id, batch_size, map_results=map_results)
                     postprocess_ms = (time.perf_counter() - _post_start) * 1000
+                    self._free.add_work("postprocess", _ft_post)
 
                 batch_end = time.perf_counter()
                 t_output_ns = time.time_ns()
@@ -1287,6 +1447,7 @@ class Scheduler:
                 if eff != "only_edge":
                     self._e2e_ms.append(e2e_latency_ms)
                 _ram_start = time.perf_counter()
+                _ft_meta = self._free.now()
                 ram_mb = self.get_ram_mb()
                 ram_ms = (time.perf_counter() - _ram_start) * 1000
 
@@ -1306,6 +1467,12 @@ class Scheduler:
                     inference_path=cloud_path,
                 )
                 write_ms = (time.perf_counter() - _write_start) * 1000
+                # Bookkeeping is work too — free time is the wall clock in which
+                # the device did NOTHING AT ALL, so reading RAM and writing a
+                # metrics row both count (guide/10, opening definition). Leaving
+                # them out is how a device that is never idle still reports free
+                # time it did not have.
+                self._free.add_work("metrics", _ft_meta)
 
                 # Completion ping → fps_queue when the CLOUD is the tier that
                 # completed this batch (split / only_cloud / adaptive split-path).
@@ -1335,19 +1502,28 @@ class Scheduler:
                     method_frame, header_frame, body = self.channel.basic_get(queue=broadcast_queue_name, auto_ack=True)
                 except self._CONN_ERRORS:
                     self._reconnect()
+                    self._free.add_wait("input", _ft_fetch)
                     continue
                 if body:
                     received_data = pickle.loads(body)
                     Log.print_with_color(f"[<<<] Received message from server {received_data}", "blue")
+                    # Reaching a control decision is work; the poll that found
+                    # nothing and the sleep after it are not.
+                    self._free.add_work("control", _ft_fetch)
                     if received_data["action"] == "STOP":
                         Log.print_with_color("[>>>] Finish!", "red")
                         break
                 else:
                     time.sleep(0.5)
+                    # The empty fetch, the empty control poll and the sleep are ONE
+                    # idle stretch, recorded as a single span rather than three
+                    # (guide/10 §2). A 0.5 s loop over a long starvation would
+                    # otherwise append thousands of intervals for one stall.
+                    self._free.add_wait("input", _ft_fetch)
 
         with open(self._timing_log_cloud, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
-        self._send_utilization(self._compute_utilization(self._timing_log_cloud, "cloud"))
+        self._send_shutdown_reports(self._timing_log_cloud, "cloud")
         try:
             cv2.destroyAllWindows()
         except Exception:
@@ -1569,11 +1745,66 @@ class Scheduler:
         if self._det_results:
             self._write_detections_json()
 
-    def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None):
+    def _apply_dispatch(self, dispatch, mode, splits, batch_size, compress):
+        """Turn the server's dispatch message into this run's measurement state.
+
+        Every flag here arrives from the server and none is read from this
+        machine's config.yaml (guide/README invariant 9). The alternative — a
+        worker deciding for itself — means a measurement setting has to be changed
+        on 12 machines, the copies drift, and one run silently mixes two
+        configurations. Called after `queue_name` is applied, so the cluster id
+        these recorders stamp is the one this device actually publishes to.
+        """
+        dispatch = dispatch or {}
+        role = "edge" if self.layer_id == 1 else "cloud"
+
+        # 12 · message size. The server names exactly one edge; every other
+        # worker gets an inert recorder whose record() returns on the first line.
+        self._msize = MessageSizeRecorder(
+            enabled=bool(dispatch.get("measure_message_size")),
+            client_id=self.client_id,
+            client_label=self._cid_short,
+            machine=self._client_name or self._cid_short,
+            role=role,
+            cluster=str(self.intermediate_queue),
+            # The context that determines the size. A size logged without it
+            # cannot be reproduced (guide/12 §4).
+            context={
+                "mode": mode,
+                "splits": splits,
+                "compress": "on" if (compress or {}).get("enable") else "off",
+                "num_bit": (compress or {}).get("num_bit"),
+                "batch_size": batch_size,
+                "chunks": self._chunks,
+            },
+            log_path=f"message_size_{self._cid_short}.log",
+            max_series=int(dispatch.get("message_size_max_series", 2000)),
+        )
+        if self._msize.enabled:
+            Log.print_with_color(
+                f"[MsgSize] this device measures payload size -> {self._msize.path}",
+                "cyan")
+
+        # 10 · free time. Every device tracks its own; the server unions the
+        # processes that share a machine.
+        self._free = FreeTimeTracker(
+            enabled=bool(dispatch.get("measure_free_time", True)),
+            client_id=self.client_id,
+            client_label=self._cid_short,
+            machine=self._client_name or self._cid_short,
+            role=role,
+            cluster=str(self.intermediate_queue),
+            bucket_s=float(dispatch.get("free_time_bucket_s", 1.0)),
+            log_path=f"free_time_{self._cid_short}.log",
+            device=str(self.device),
+        )
+
+    def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None, dispatch=None):
         if queue_name != self.intermediate_queue:
             self.intermediate_queue = queue_name
             self.channel.queue_declare(self.intermediate_queue, durable=False,
                                        arguments=get_intermediate_queue_args())
+        self._apply_dispatch(dispatch, mode, splits, batch_size, compress)
         Log.print_with_color(
             f"[Slots] queue={self.intermediate_queue} chunks/batch={self._chunks} "
             f"({self._frames_per_chunk} frames each)", "cyan")

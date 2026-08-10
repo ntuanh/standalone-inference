@@ -128,8 +128,24 @@ split_inference/
 |   ├── overview.png
 │   └── SI-Inference.jpg
 │
+├── guide/             # The portable result-format specification + validators
+│   ├── 01-result-format.md   # normative: the contract every log line obeys
+│   ├── validate_results.py   # conformance check for a run directory
+│   └── validate_palette.py   # colourblind-safety check for the chart palette
+│
+├── tools/
+│   ├── build_nb.py    # emits the visualization notebook (guide/08)
+│   └── run_nb.py      # executes it headless, reporting every cell error
+│
 ├── src/               # Core framework modules
-└── output.csv         # Performance results
+│   ├── Server.py      # controller: dispatch, collection, rollups, archive
+│   ├── Scheduler.py   # per-device tier loops and their instrumentation
+│   ├── Results.py     # result-format line builders + the archiver
+│   ├── FreeTime.py    # per-device idle tracking      (guide/10)
+│   ├── BrokerRam.py   # RabbitMQ host RAM sampling    (guide/11)
+│   └── MessageSize.py # payload size on the wire      (guide/12)
+│
+└── results/           # Archived runs (git-ignored) + the notebook (tracked)
 ```
 
 ---
@@ -365,7 +381,7 @@ The ping body is an **identity** (the producing cluster, e.g. `intermediate_queu
 
 ## Run Result Files
 
-The server emits the portable result format specified in [`guide/`](guide/) — seven plain-text files in `log-path`, every line starting with a nanosecond-epoch timestamp taken on the **server's** clock followed by `key=value` pairs. All seven are truncated at server startup, so the directory always describes exactly one run.
+The server emits the portable result format specified in [`guide/`](guide/) — plain-text files in `log-path`, every line starting with a nanosecond-epoch timestamp taken on the **server's** clock followed by `key=value` pairs. **All** of them are truncated at server startup, including the ones whose feature is switched off, so the directory always describes exactly one run and a present-but-empty file is a valid "this run had none".
 
 | File | Written | One line per |
 |---|---|---|
@@ -376,6 +392,23 @@ The server emits the portable result format specified in [`guide/`](guide/) — 
 | `utilization_cluster.log` | shutdown | cluster, cluster×role, `SYSTEM` |
 | `latency_cluster.log` | shutdown | cluster×role×kind, cluster e2e, `SYSTEM` e2e |
 | `events_ns.log` | live | adaptive route flip |
+| `free_time.log` | shutdown | device (idle wall clock) |
+| `free_time_cluster.log` | shutdown | cluster, cluster×role, `FREE` reason, `KIND`, `MACHINE`, `SYSTEM` |
+| `free_time_series.log` | shutdown | device per time bucket |
+| `broker_ram_ns.log` | live | RAM sample of the RabbitMQ host |
+| `broker_ram.log` | shutdown | `BROKER` / `USED` / `DELTA` / `RABBIT`, then `PHASE` per phase + `COMPARE` |
+| `message_size.log` | shutdown | measured worker (normally exactly one) |
+| `message_size_series.log` | shutdown | published message |
+
+The last seven are the three **optional measurements**, each all-its-files-or-none, each switched by a flag in `config.yaml`:
+
+| Feature | Flag | Measures |
+|---|---|---|
+| Free time (`guide/10`) | `free-time.enable` | the wall clock in which a device did **nothing at all** — run span minus the *union* of every lane's busy intervals. Not utilization and not `1 − utilization`: a back-pressure wait inside a unit window is busy for one and free for the other, and capture work on another lane is the reverse. Emit both; when they disagree loudly, the gap is the finding. |
+| Broker RAM (`guide/11`) | `broker-ram.enable` | the RabbitMQ host, which runs no code of ours, sampled by the server over **one** long-lived SSH session (never a connection per sample). The window opens at controller start and closes a second past the drain, so `idle`/`run`/`tail` phases turn "this host was using N MB" into "running the system costs this host +N MB". |
+| Message size (`guide/12`) | `message-size.enable` | the serialized bytes one worker hands to pika, recorded **before** each publish. Exactly one worker measures — the first edge to register — and the **server** picks it and says so in the dispatch message. |
+
+Every one of those flags lives only in the server's `config.yaml` and travels to the workers inside the `START` message; no client reads a measurement setting from its own file. Turning a flag off also skips the server's own shutdown collector for it, so shutdown never burns a timeout polling a queue nobody will publish to.
 
 This project uses the **`cluster`** filename scheme (never mixed with the `group_*` scheme — see `guide/01-result-format.md` §2). How the guide's neutral terms map here:
 
@@ -398,7 +431,16 @@ python guide/validate_results.py . --names cluster
 python guide/validate_results.py results/results_0801_1556_adaptive --names cluster
 ```
 
-It catches the measurement bugs that code review does not: two tiers pinging the same batch (cluster `done` sums past `SYSTEM`), a tier that stopped reporting early (line-count mismatch between `batch_done_ns.log` and `fps_cluster_ns.log`), overlapping busy intervals (utilization above 100%), and percentiles computed on pre-averaged data (`p50 > p95`).
+It catches the measurement bugs that code review does not: two tiers pinging the same batch (cluster `done` sums past `SYSTEM`), a tier that stopped reporting early (line-count mismatch between `batch_done_ns.log` and `fps_cluster_ns.log`), overlapping busy intervals (utilization above 100%), percentiles computed on pre-averaged data (`p50 > p95`), busy intervals summed instead of merged (`busy_s + free_s != span_s`), and free-time attribution that leaks (reason shares not summing to 100%).
+
+**Charting** — the notebook renders any conforming run directory with no chart-code changes, which is the entire point of fixing the format. It discovers every subdirectory of `results/` holding a `batch_done_ns.log` and treats it as one run, so a single run works and two runs additionally get the comparison chart.
+
+```bash
+python tools/build_nb.py && python tools/run_nb.py
+# -> results/visual/Result Visualization.ipynb, charts in results/imgs/
+```
+
+Fix a chart in `tools/build_nb.py` and re-run both — never patch the `.ipynb` directly, because the next build silently reverts it. Only the notebook is tracked in git; run data and rendered PNGs are not, so a checkout never carries someone else's numbers.
 
 ---
 

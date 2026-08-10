@@ -6,6 +6,7 @@ import base64
 import time
 import pika
 import pickle
+import src.BrokerRam
 import src.Model
 import src.Log
 import src.Results
@@ -135,6 +136,20 @@ class Server:
         self.channel.queue_declare(queue='events_queue', durable=False)
         self.channel.queue_purge(queue='events_queue')
 
+        # message_size_queue: ONE edge — the first to register, chosen here and
+        # told in its START message — reports the sizes of the bodies it put on
+        # the wire. Same dedicated-queue reasoning as utilization: the worker
+        # finishes long before the server does, and the queue absorbs the gap.
+        self.channel.queue_declare(queue='message_size_queue', durable=False)
+        self.channel.queue_purge(queue='message_size_queue')
+
+        # free_time_queue: one whole-run free-time report per device, carrying its
+        # MERGED busy intervals so the server can union the processes that share a
+        # machine (guide/10 §4). Kept off utilization_queue because those intervals
+        # make the message far larger than a utilization report.
+        self.channel.queue_declare(queue='free_time_queue', durable=False)
+        self.channel.queue_purge(queue='free_time_queue')
+
         self.register_clients = [0 for _ in range(len(self.total_clients))]
         self.list_clients = []
         self.registered_ids = set()
@@ -179,26 +194,75 @@ class Server:
         self.data = config["data"]
         self.compress = config["compress"]
 
+        # ---- optional-measurement feature flags ------------------------------
+        # Each flag lives HERE, in the server's config, and travels to the workers
+        # in the dispatch message (README invariant 9). No worker reads any of
+        # them from its own config.yaml, or a measurement setting would have to be
+        # changed on 12 machines, the copies would drift, and a run would silently
+        # mix two configurations.
+        #
+        # Turning a flag off also skips the server's own shutdown collector for it
+        # (README invariant 10). A collector that still polls a queue nobody will
+        # ever publish to burns its full timeout on every run and then warns 0/N —
+        # a stall and a scary message caused by a setting working as intended.
+        msize_cfg = config.get("message-size") or {}
+        self.msize_enabled = bool(msize_cfg.get("enable", True))
+        self.msize_max_series = int(msize_cfg.get("max_series", 2000))
+        self.msize_client = None        # chosen at dispatch: first edge to register
+
+        free_cfg = config.get("free-time") or {}
+        self.free_time_enabled = bool(free_cfg.get("enable", True))
+        self.free_time_bucket_s = float(free_cfg.get("bucket_s", 1.0))
+
         self.log_path = log_path = config["log-path"]
-        # The seven result files (guide/01-result-format.md §2), 'cluster' naming
+        # The result files (guide/01-result-format.md §2), 'cluster' naming
         # scheme. ALL of them are truncated here — once, centrally, before any
         # worker can write — so a results directory always describes exactly one
         # run. Truncating a file only when the feature that writes it is enabled
         # is the trap in 05 §4: a later run inherits the previous run's file and
-        # the archiver stamps stale data into a fresh archive.
+        # the archiver stamps stale data into a fresh archive. The optional files
+        # are therefore truncated even when their feature is off, which is also
+        # what makes "present but empty" a valid answer instead of a missing file
+        # the reader chokes on (01 §2).
         self.result_files = {
-            "batch":   f"{log_path}/batch_done_ns.log",        # system rate series
-            "rate_ns": f"{log_path}/fps_cluster_ns.log",       # per-cluster series
-            "rate":    f"{log_path}/fps_cluster.log",          # rate summary
-            "util":    f"{log_path}/utilization.log",          # per device
-            "util_c":  f"{log_path}/utilization_cluster.log",  # rolled up
-            "lat":     f"{log_path}/latency_cluster.log",      # distributions
-            "events":  f"{log_path}/events_ns.log",            # control plane
+            "batch":      f"{log_path}/batch_done_ns.log",        # system rate series
+            "rate_ns":    f"{log_path}/fps_cluster_ns.log",       # per-cluster series
+            "rate":       f"{log_path}/fps_cluster.log",          # rate summary
+            "util":       f"{log_path}/utilization.log",          # per device
+            "util_c":     f"{log_path}/utilization_cluster.log",  # rolled up
+            "lat":        f"{log_path}/latency_cluster.log",      # distributions
+            "events":     f"{log_path}/events_ns.log",            # control plane
+            # free time (01 §3.8-3.10) — all three or none
+            "free":       f"{log_path}/free_time.log",            # per device
+            "free_c":     f"{log_path}/free_time_cluster.log",    # rolled up
+            "free_s":     f"{log_path}/free_time_series.log",     # per bucket
+            # broker RAM (01 §3 files 11-12) — both or neither
+            "ram_ns":     f"{log_path}/broker_ram_ns.log",        # live series
+            "ram":        f"{log_path}/broker_ram.log",           # summary
+            # message size (01 §3.11-3.12) — both or neither
+            "msize":      f"{log_path}/message_size.log",         # per measured worker
+            "msize_s":    f"{log_path}/message_size_series.log",  # per message
         }
         for path in self.result_files.values():
             open(path, "w").close()
         self.batch_log_path = self.result_files["batch"]
         self.utilization_log_path = self.result_files["util"]
+
+        # The broker host's RAM (guide/11). The window opens HERE, in the
+        # constructor — before any worker registers and long before anything is
+        # published — so the series contains this host at rest as well as under
+        # load. Starting at dispatch instead would give a baseline of the wrong
+        # thing: one sample, on a machine already connected to and already having
+        # had its queues declared and purged. What the file needs is the
+        # counterfactual (this host while the system is not running at all), which
+        # is a stretch of samples and only exists before the run does.
+        self.broker_ram = src.BrokerRam.BrokerRamSampler(
+            config,
+            series_path=self.result_files["ram_ns"],
+            summary_path=self.result_files["ram"],
+            log=src.Log.print_with_color)
+        self.broker_ram.start()
+
         self.logger = src.Log.Logger(f"{log_path}/app.log", config["debug-mode"])
         plan = transport_plan(config)
         src.Log.print_with_color(describe_transport_plan(plan),
@@ -520,6 +584,106 @@ class Server:
             except Exception as e:
                 src.Log.print_with_color(f"[Results] {key} write failed: {e}", "yellow")
 
+    def _collect_message_size(self, timeout_s=15.0):
+        """Drain message_size_queue and write the two payload-size files.
+
+        Returns immediately when the feature is off (README invariant 10) — the
+        alternative is polling a queue nobody will ever publish to, which burns
+        the whole timeout on every run and then warns about the 0 reports it was
+        guaranteed to get.
+
+        Exactly one report is expected, so this stops on the first one rather than
+        waiting out the timeout: the measuring worker is a single edge and it
+        published before it exited."""
+        if not self.msize_enabled or self.msize_client is None:
+            return
+        reports = []
+        deadline = time.time() + timeout_s
+        while not reports and time.time() < deadline:
+            try:
+                method_frame, _, body = self.channel.basic_get(
+                    queue='message_size_queue', auto_ack=True)
+            except Exception:
+                break
+            if not method_frame:
+                time.sleep(0.2)
+                continue
+            try:
+                msg = pickle.loads(body)
+            except Exception:
+                continue
+            if msg.get("action") == "MESSAGE_SIZE":
+                reports.append(msg)
+
+        if not reports:
+            src.Log.print_with_color(
+                f"[MsgSize] no report from {self.msize_client} before timeout — "
+                f"{self.result_files['msize']} is empty", "yellow")
+            return
+
+        summary, series = src.Results.message_size_lines(
+            time.time_ns(), reports, self.batch_size)
+        for key, lines in (("msize", summary), ("msize_s", series)):
+            try:
+                with open(self.result_files[key], "w") as f:
+                    f.write("\n".join(lines) + "\n" if lines else "")
+            except Exception as e:
+                src.Log.print_with_color(f"[MsgSize] {key} write failed: {e}", "yellow")
+        for line in summary:
+            src.Log.print_with_color(f"[MsgSize] {line}", "green")
+
+    def _collect_free_time(self, timeout_s=30.0):
+        """Drain free_time_queue and write the three free-time files.
+
+        Same dedicated-queue reasoning as utilization (03 §4): the clouds publish
+        theirs only after STOP, when rpc_queue consuming has already stopped, so
+        the reports have to sit on the broker until this runs. A partial
+        collection is acceptable and warns; it never aborts the run."""
+        if not self.free_time_enabled:
+            return
+        expected = len(set(cid for cid, _ in self.list_clients))
+        reports = []
+        deadline = time.time() + timeout_s
+        while len(reports) < expected and time.time() < deadline:
+            try:
+                method_frame, _, body = self.channel.basic_get(
+                    queue='free_time_queue', auto_ack=True)
+            except Exception:
+                break
+            if not method_frame:
+                time.sleep(0.2)
+                continue
+            try:
+                msg = pickle.loads(body)
+            except Exception:
+                continue
+            if msg.get("action") == "FREE_TIME":
+                reports.append(msg)
+
+        if not reports:
+            src.Log.print_with_color(
+                "[FreeTime] no reports collected — the three free-time files are "
+                "empty for this run", "yellow")
+            return
+        if len(reports) < expected:
+            src.Log.print_with_color(
+                f"[FreeTime] Collected {len(reports)}/{expected} reports before "
+                f"timeout", "yellow")
+
+        ts_ns = time.time_ns()
+        per_device = src.Results.free_time_lines(ts_ns, reports)
+        rollup = src.Results.free_time_rollup_lines(ts_ns, reports)
+        series = src.Results.free_time_series_lines(ts_ns, reports)
+        for key, lines in (("free", per_device), ("free_c", rollup), ("free_s", series)):
+            try:
+                with open(self.result_files[key], "w") as f:
+                    f.write("\n".join(lines) + "\n" if lines else "")
+                src.Log.print_with_color(
+                    f"[FreeTime] Wrote {len(lines)} lines to {self.result_files[key]}",
+                    "green")
+            except Exception as e:
+                src.Log.print_with_color(f"[FreeTime] {key} write failed: {e}", "yellow")
+
     def _archive(self):
         """Snapshot this run's logs plus the config that produced them, after the
         last shutdown writer has run. Without the config the numbers are
@@ -550,6 +714,18 @@ class Server:
         # whole-run utilization report plus their raw latency samples — persist
         # them before shutting down.
         self._collect_utilization()
+        # The optional measurements, each gated on its own flag so a disabled
+        # feature costs nothing at shutdown (README invariant 10).
+        self._collect_free_time()
+        self._collect_message_size()
+        # The last collector finishing is not the system being idle: the drain is
+        # still settling, and a memory curve stopped here ends on the busiest
+        # moment of the shutdown. Mark the tail, sample a second or two past it,
+        # then summarise — the drain is precisely when a backed-up host gives
+        # memory back, so a curve that does NOT fall here is the signal that
+        # something is still holding units (guide/11 §6).
+        self.broker_ram.mark_tail()
+        self.broker_ram.stop_and_summarize()
         # Archive last: every shutdown writer has now run, so the snapshot is
         # complete. Archiving is best-effort and never blocks a clean exit.
         self._archive()
@@ -728,6 +904,25 @@ class Server:
                 f"Sending model {self.model_name} to {len(clients_to_notify)} clients "
                 f"(list_clients={len(self.list_clients)}).", "green")
 
+            # Pick the ONE worker that measures payload size: the first client
+            # that registered at the first stage (guide/12 §1). Registration order
+            # needs no configuration, is stable within a run, and is already known
+            # here — before anything is dispatched. "First at the first stage" is
+            # what makes the number meaningful: the first stage is the one whose
+            # output crosses the network, and every edge publishes the same
+            # payload shape from the same split point.
+            self.msize_client = None
+            if self.msize_enabled:
+                self.msize_client = next(
+                    (cid for cid, lid in clients_to_notify if lid == 1), None)
+                if self.msize_client is None:
+                    src.Log.print_with_color(
+                        "[MsgSize] no first-stage client registered — message size "
+                        "will not be measured this run", "yellow")
+                else:
+                    src.Log.print_with_color(
+                        f"[MsgSize] {self.msize_client} will measure payload size", "cyan")
+
             for (client_id, layer_id) in clients_to_notify:
                 assignment = self.client_assignments.get(client_id, {})
                 response = {
@@ -742,12 +937,23 @@ class Server:
                     "data":       self.data,
                     "compress":   self.compress,
                     "mode":       self._get_mode(),
+                    # Both optional measurements travel in the dispatch message,
+                    # never in the worker's own config (README invariant 9).
+                    "measure_message_size": bool(
+                        self.msize_enabled and client_id == self.msize_client),
+                    "message_size_max_series": self.msize_max_series,
+                    "measure_free_time":   self.free_time_enabled,
+                    "free_time_bucket_s":  self.free_time_bucket_s,
                 }
                 self.send_to_response(client_id, pickle.dumps(response))
 
             # Inference effectively starts now — anchor for the exact
-            # SYSTEM FPS (frames / START->last-DONE time) in the final summary.
+            # SYSTEM FPS (frames / START->last-DONE time) in the final summary,
+            # and the idle->run boundary for the broker's memory curve. The mark
+            # partitions the series; it never pauses the sampling, so a run that
+            # never dispatched is all 'idle', which is exactly what it was.
             self._fps_start_t = time.time()
+            self.broker_ram.mark_run()
         else:
             response = {"action": "STOP", "message": "Stop inference !!!"}
             for (client_id, layer_id) in self.list_clients:

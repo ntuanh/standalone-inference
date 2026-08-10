@@ -183,7 +183,24 @@ metrics_pivot.lock
 *.npy
 app.log
 
-# Archived run results (guide/05-archiving.md). Ignored as a whole directory:
-# '*.log' above already excludes the seven result files, so tracking the
-# config.yaml copied beside them would commit a run description with no numbers.
-results/
+# Archived run results (guide/05-archiving.md). The measurements themselves are
+# NOT tracked: '*.log' above already excludes every result file, so committing the
+# config.yaml copied beside them would be a run description with no numbers, and
+# the rendered PNGs would be charts of data nobody else has.
+#
+# The notebook IS tracked — it is the deliverable (guide/08 §1), and it discovers
+# whatever run directories are present at execution time, so it is useful without
+# them. Note 'results/*' rather than 'results/': git will not descend into an
+# ignored DIRECTORY, so a negation inside one never matches.
+results/*
+!results/visual/
+results/visual/*
+!results/visual/*.ipynb
+
+# Per-device measurement artifacts (guide/10 §5, guide/12 §3). Each device keeps
+# its own copy so a broker or server failure still leaves the samples behind; the
+# pooled result files supersede them.
+timing_edge_*.log
+timing_cloud_*.log
+free_time_*.log
+message_size_*.log

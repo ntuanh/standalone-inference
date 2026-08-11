@@ -370,18 +370,17 @@ class Server:
 
         self._fps_times.append(t_s)
         n = len(self._fps_times)
-        window_fps = None
-        if n >= W:
-            span = self._fps_times[-1] - self._fps_times[-W]
-            if span > 0:
-                window_fps = (W - 1) * self.batch_size / span
-                src.Log.print_with_color(
-                    f"[FPS] DONE #{n}  window_fps={window_fps:6.2f} (last {W} batches)", "cyan")
+        # Both series lines come from src.Results, which is also what
+        # tools/selftest_format.py drives — the line formats are therefore
+        # exercisable without a broker, and the file the validator reads is
+        # built by the same code the test checked.
+        window_fps = src.Results.window_rate(self._fps_times, self.batch_size, W)
+        if window_fps is not None:
+            src.Log.print_with_color(
+                f"[FPS] DONE #{n}  window_fps={window_fps:6.2f} (last {W} batches)", "cyan")
         with open(self.batch_log_path, "a") as f:
-            if window_fps is None:
-                f.write(f"{t_ns}\n")
-            else:
-                f.write(f"{t_ns} {window_fps:.2f}\n")
+            f.write(src.Results.batch_done_line(t_ns, self._fps_times,
+                                                self.batch_size, W) + "\n")
 
         # Per-cluster series. Each cluster runs its OWN window counter, so it
         # reaches its first full window later than the system does — that is
@@ -389,14 +388,9 @@ class Server:
         # conformance check the validator runs.
         times = self._fps_cluster_times.setdefault(cluster, [])
         times.append(t_s)
-        c_n = len(times)
-        line = f"{t_ns} cluster={cluster} done={c_n}"
-        if c_n >= W:
-            c_span = times[-1] - times[-W]
-            if c_span > 0:
-                line += f" window_fps={(W - 1) * self.batch_size / c_span:.2f}"
         with open(self.result_files["rate_ns"], "a") as f:
-            f.write(line + "\n")
+            f.write(src.Results.rate_series_line(t_ns, cluster, times,
+                                                 self.batch_size, W) + "\n")
 
     def on_fps_done(self, ch, method, _, body):
         # The arrival is the event; the body is read ONLY to bucket this batch.
@@ -547,11 +541,7 @@ class Server:
                 continue
             got += 1
             reports.append(msg)
-            line = (f"{time.time_ns()} client={msg.get('client_id')} "
-                    f"role={msg.get('role')} packages={msg.get('packages')} "
-                    f"busy_s={msg.get('busy_ns', 0) / 1e9:.3f} "
-                    f"total_s={msg.get('total_ns', 0) / 1e9:.3f} "
-                    f"utilization={msg.get('utilization', 0) * 100:.2f}%")
+            line = src.Results.utilization_device_line(time.time_ns(), msg)
             with open(self.utilization_log_path, "a") as f:
                 f.write(line + "\n")
             src.Log.print_with_color(f"[Utilization] {line}", "green")

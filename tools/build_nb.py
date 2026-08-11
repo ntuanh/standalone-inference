@@ -97,6 +97,10 @@ MUTED   = "#898781"; GRID  = "#e1e0d9"; AXIS = "#c3c2b7"
 # mechanism, not cosmetics. Validated with:
 #   python guide/validate_palette.py "#2a78d6,#eb6834,#1baf7a" light all
 S1, S2, S3, S4 = "#2a78d6", "#eb6834", "#1baf7a", "#eda100"
+# Status colours, and they do NOT pass the CVD check as a pair (green/red are
+# ~4 dE apart under deuteranopia) — no red/green pair can. That is why the one
+# chart using them, C10, prints the verdict as a WORD beside every bar: colour
+# alone never carries the good/bad reading. Do not "fix" this by re-tinting.
 GOOD, BAD, NEUTRAL = "#0ca30c", "#d03b3b", MUTED
 # Sequential blue, light -> dark. For a discrete ordered ramp on a light surface,
 # start no lighter than #86b6ef.
@@ -147,6 +151,19 @@ def label_bars(ax, bars, fmt="{:.2f}", dy=3, fontsize=9, color=INK_2):
         ax.annotate(fmt.format(h), xy=(bar.get_x() + bar.get_width() / 2, h),
                     xytext=(0, dy), textcoords="offset points",
                     ha="center", va="bottom", fontsize=fontsize, color=color)
+
+def shorten(text, limit=46):
+    """Trim free text for an annotation without leaving it mid-word. A blunt
+    `text[:46]` cut an events_ns.log description to '...edge_only (' in the
+    render — a dangling bracket reads as a rendering fault rather than as a
+    label that was too long."""
+    text = str(text).strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rstrip()
+    if " " in cut:
+        cut = cut[:cut.rindex(" ")]
+    return cut.rstrip(" ([{-") + "…"
 
 # Colour follows the ENTITY, never its rank: dicts, never palette[i] over a
 # filtered list. A reader who learned "edge is orange" must not be misled by a
@@ -632,13 +649,21 @@ bp = ax.boxplot(data, positions=positions, widths=0.28, patch_artist=True,
 for patch, c in zip(bp["boxes"], colours):
     patch.set_facecolor(c); patch.set_edgecolor(SURFACE); patch.set_linewidth(1.2)
 
+caps = []
 for pos, vals in zip(positions, data):
     # Label ABOVE the whisker cap: p75 sits inside the whisker and the text
     # would land on top of it.
     q1, q3 = np.percentile(vals, [25, 75])
     cap = vals[vals <= q3 + 1.5 * (q3 - q1)].max()
+    caps.append(cap)
     ax.annotate(f"{vals.mean():.1f}", xy=(pos, cap), xytext=(0, 7),
                 textcoords="offset points", ha="center", fontsize=9, color=INK_2)
+
+# Headroom for those labels. Autoscale stops at the whisker cap, so the text —
+# which is drawn 7pt ABOVE it — lands on the top spine and is clipped. The
+# render showed exactly that; charts are checked by looking at them.
+lo, hi = ax.get_ylim()
+ax.set_ylim(lo, max(hi, max(caps) + (hi - lo) * 0.08))
 
 # ax.boxplot returns no legend handles — build Rectangle proxies.
 if MULTI_RUN:
@@ -711,6 +736,11 @@ else:
     axes = axes[0]
     x, width = np.arange(len(stats)), 0.36 if MULTI_RUN else 0.5
     ymax = np.nanmax(e2e[[c for c, _ in stats]].to_numpy()) / 1000.0
+    # 24 bars want a short label, but "{:.0f}" on a 10-second e2e prints 13 and
+    # 14 for 13.4 s and 13.7 s — the reader sees a gap that is not there. Pick
+    # the precision from the magnitude rather than pinning it: a run whose e2e
+    # is in minutes gets the compact form, a fast one keeps its tenth.
+    e2e_fmt = "{:.0f}" if ymax >= 100 else "{:.1f}"
     for ax, scope in zip(axes, scopes):
         sub = e2e[e2e.scope == scope].set_index("run")
         for i, run in enumerate(RUN_ORDER):
@@ -719,7 +749,7 @@ else:
             vals = [float(np.ravel(sub.loc[run, col])[0]) / 1000.0 for col, _ in stats]
             off = (i - (len(RUN_ORDER) - 1) / 2) * (width + 0.03)
             b = ax.bar(x + off, vals, width, label=run, color=RUN_COLOR[run], **BAR_KW)
-            label_bars(ax, b, fmt="{:.0f}", fontsize=8.5)
+            label_bars(ax, b, fmt=e2e_fmt, fontsize=8.5)
         ax.set_xticks(x, [lbl for _, lbl in stats])
         ax.set_title(scope)
         ax.set_ylim(0, ymax * 1.16)
@@ -842,14 +872,18 @@ else:
         for j, (_, e) in enumerate(ev.iterrows()):
             # Event rules are chrome, not data: muted hairlines, never a series colour.
             ax.axvline((int(e.ts) - t0) / 1e9, color=MUTED, linewidth=1.0)
-            ax.annotate(e.description[:46], xy=((int(e.ts) - t0) / 1e9, ymax),
+            ax.annotate(shorten(e.description), xy=((int(e.ts) - t0) / 1e9, ymax),
                         xytext=(3, -10 - 12 * (j % 3)),      # stagger: events cluster
                         textcoords="offset points", fontsize=8, color=MUTED, va="top")
         ax.set_title(f"{run}  —  {len(ev)} control event(s)")
         ax.set_ylabel("Window rate (frames/s)")
         ax.set_ylim(0, ymax)
         ax.grid(axis="x", visible=False)
-        ax.legend(loc="upper left")
+        # NOT upper left: the event labels hang from the top of the axes and the
+        # first one starts at x≈0 on a run whose first flip comes early, which
+        # put the description straight through the legend text in the render.
+        # The series sits high, so the bottom of the panel is the free space.
+        ax.legend(loc="lower left")
     axes[-1].set_xlabel("Seconds since first completion")
     fig.suptitle("Throughput response to control events", fontsize=14,
                  fontweight="semibold", color=INK, y=1.01)
@@ -1023,10 +1057,15 @@ if df_fts.empty:
 else:
     run = RUN_ORDER[0]
     sub = df_fts[df_fts.run == run]
+    order = sub.drop_duplicates("client").sort_values(["role", "client"])
     piv = (sub.pivot_table(index="client", columns="i", values="free")
-           .reindex(sub.drop_duplicates("client")
-                    .sort_values(["role", "client"]).client))
-    role_of = dict(zip(sub.client, sub.role))
+           .reindex(order.client))
+    # Same C1/C2/E1… scheme as C8 and C12, so a straggler spotted in one chart
+    # can be found in the others. A raw client id on the axis makes that
+    # cross-reference a manual diff of two uuid prefixes.
+    ticks = order.groupby("role").cumcount() + 1
+    dev_label = {c: f"{r[0].upper()}{n}"
+                 for c, r, n in zip(order.client, order.role, ticks)}
     bucket_s = float(sub.bucket_s.iloc[0])
 
     from matplotlib.colors import LinearSegmentedColormap
@@ -1041,8 +1080,8 @@ else:
                    extent=[0, piv.shape[1] * bucket_s, len(piv) - 0.5, -0.5],
                    interpolation="nearest")
     ax.set_yticks(np.arange(len(piv)),
-                  [f"{role_of.get(c, '?')[0].upper()}  {c}" for c in piv.index],
-                  fontsize=8.5)
+                  [dev_label.get(c, str(c)) for c in piv.index], fontsize=9)
+    ax.set_ylabel("Device  (C = cloud, E = edge)")
     ax.set_xlabel("Seconds since that device's own start "
                   "(device clocks — offsets are exact, but not comparable between devices)")
     ax.set_title(f"{run} — when each device was doing nothing  "
@@ -1079,23 +1118,33 @@ else:
         pt = t[sub.phase.values == phase]
         if len(pt):
             ax.axvspan(pt.min(), pt.max(), color=PHASE_TINT[phase], zorder=0)
+            # ABOVE the axes, not inside it: the memory curve runs along the top
+            # of this panel for the whole run, so a label at y=1.0 lands on the
+            # line it is describing.
             ax.annotate(phase, xy=((pt.min() + pt.max()) / 2, 1.0),
-                        xycoords=("data", "axes fraction"), xytext=(0, -12),
+                        xycoords=("data", "axes fraction"), xytext=(0, 4),
                         textcoords="offset points", ha="center",
-                        fontsize=9, color=MUTED)
+                        fontsize=9, color=MUTED, annotation_clip=False)
     ax.plot(t, sub.used_mb, color=S1, label="host used (MemTotal − MemAvailable)", **LINE_KW)
     ax.plot(t, sub.rss_mb, color=S2, label="broker process RSS", **LINE_KW)
     idle = sub[sub.phase == "idle"]
     if len(idle):
         base = idle.used_mb.mean()
         ax.axhline(base, color=S1, linewidth=1.0, alpha=0.45)
-        ax.annotate(f"idle baseline {base:.0f} MB", xy=(t.iloc[-1], base),
-                    xytext=(-4, 6), textcoords="offset points", ha="right",
-                    fontsize=9, color=S1)
+        # Under the rule and a third of the way in: at the right-hand end the
+        # used curve comes back down towards this baseline, which is exactly
+        # where the tail matters and exactly where the text collided with it.
+        ax.annotate(f"idle baseline {base:.0f} MB",
+                    xy=(t.iloc[len(t) // 3], base),
+                    xytext=(0, -6), textcoords="offset points", ha="center",
+                    va="top", fontsize=9, color=S1)
     ax.set_ylabel("Memory (MB)")
     ax.set_title(f"{run} — broker host memory  "
                  f"(source = {sub.source.iloc[0]})")
-    ax.legend(loc="lower right")
+    # Both curves occupy the top and the bottom-right of this panel (host used
+    # runs high, RSS runs low and the tail drops through the corner). The band
+    # between them is empty for the whole run, so the legend goes there.
+    ax.legend(loc="center left")
     ax.grid(axis="x", visible=False)
 
     ax = axes[1]

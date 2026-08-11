@@ -134,6 +134,7 @@ split_inference/
 │   └── validate_palette.py   # colourblind-safety check for the chart palette
 │
 ├── tools/
+│   ├── selftest_format.py  # format conformance without a broker (guide/09 phase 6)
 │   ├── build_nb.py    # emits the visualization notebook (guide/08)
 │   └── run_nb.py      # executes it headless, reporting every cell error
 │
@@ -432,6 +433,14 @@ python guide/validate_results.py results/results_0801_1556_adaptive --names clus
 ```
 
 It catches the measurement bugs that code review does not: two tiers pinging the same batch (cluster `done` sums past `SYSTEM`), a tier that stopped reporting early (line-count mismatch between `batch_done_ns.log` and `fps_cluster_ns.log`), overlapping busy intervals (utilization above 100%), percentiles computed on pre-averaged data (`p50 > p95`), busy intervals summed instead of merged (`busy_s + free_s != span_s`), and free-time attribution that leaks (reason shares not summing to 100%).
+
+Both of those commands need a finished distributed run. To check the **format** without one — after touching a line builder, or on a machine with no broker — run the self-test:
+
+```bash
+python tools/selftest_format.py
+```
+
+It builds a run directory out of the real line builders (`src/Results.py`, `FreeTime`, `MessageSize`, `BrokerRam`) fed synthetic device reports, validates it, and then corrupts a copy eleven ways — one per row of the common-failures table in `guide/09-port-checklist.md` — asserting the validator rejects each and names the check that fired. A validator nobody has ever seen fail is not evidence. Add `--keep results` to leave two fixture runs behind for exercising the charts; the numbers in them are synthetic, so never archive or quote one.
 
 **Charting** — the notebook renders any conforming run directory with no chart-code changes, which is the entire point of fixing the format. It discovers every subdirectory of `results/` holding a `batch_done_ns.log` and treats it as one run, so a single run works and two runs additionally get the comparison chart.
 

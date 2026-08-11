@@ -81,6 +81,66 @@ def _mean_ratio(reports):
 
 
 # --------------------------------------------------------------------------
+# batch_done_ns.log / fps_cluster_ns.log  (01 §3.1-3.2)
+# --------------------------------------------------------------------------
+
+# Charts assume this width (01 §3.1). It lives here rather than in the server so
+# the two live series and the console line can never disagree about it.
+WINDOW = 16
+
+
+def window_rate(times_s, batch_size, window=WINDOW):
+    """Smoothed rate over the last `window` completions, or None before that many
+    exist. None rather than 0.0 on purpose: a zero would be indistinguishable
+    from a genuine stall, so absence means 'no window yet' (01 §3.1)."""
+    if len(times_s) < window:
+        return None
+    span = times_s[-1] - times_s[-window]
+    if span <= 0:
+        return None
+    return (window - 1) * batch_size / span
+
+
+def batch_done_line(ts_ns, times_s, batch_size, window=WINDOW):
+    """One line of batch_done_ns.log — the authoritative system-wide series.
+
+    TWO arities: bare timestamp during warm-up, timestamp + rate afterwards. That
+    is the single most common parsing bug in a port, so it is emitted from one
+    place and exercised by tools/selftest_format.py."""
+    rate = window_rate(times_s, batch_size, window)
+    return f"{ts_ns}" if rate is None else f"{ts_ns} {rate:.2f}"
+
+
+def rate_series_line(ts_ns, cluster, times_s, batch_size, window=WINDOW):
+    """One line of fps_cluster_ns.log — the same arrival, bucketed by cluster.
+
+    Each cluster runs its OWN window counter, so it reaches its first full window
+    later than the system does; that is correct, not a bug. Exactly one of these
+    per batch_done_ns.log line, which is the conformance check the validator
+    runs."""
+    line = f"{ts_ns} cluster={cluster} done={len(times_s)}"
+    rate = window_rate(times_s, batch_size, window)
+    if rate is not None:
+        line += f" window_fps={rate:.2f}"
+    return line
+
+
+# --------------------------------------------------------------------------
+# utilization.log  (01 §3.4)
+# --------------------------------------------------------------------------
+
+def utilization_device_line(ts_ns, report):
+    """One line per device, stamped with the report's ARRIVAL on the server's
+    clock — never a device timestamp. `busy_s` and `total_s` both come from that
+    one device's own clock, which is what keeps clock skew out of the ratio."""
+    return (f"{ts_ns} client={report.get('client_id')} "
+            f"role={report.get('role')} packages={report.get('packages')} "
+            f"busy_s={report.get('busy_ns', 0) / 1e9:.3f} "
+            f"total_s={report.get('total_ns', 0) / 1e9:.3f} "
+            f"utilization={report.get('utilization', 0) * 100:.2f}%")
+
+
+# --------------------------------------------------------------------------
 # fps_cluster.log  (01 §3.3)
 # --------------------------------------------------------------------------
 

@@ -525,9 +525,10 @@ def archive_run(log_path, filenames, tag, config_path="config.yaml", now=None):
     Copies rather than moves, so every existing reader keeps finding the live
     logs where they are (the next run truncates them itself). Empty files are
     skipped: a zero-length log must never be archived as a misleading result.
-    Since the server truncates all seven files unconditionally at startup, "not
-    empty" here really does mean "written by this run" — no stale file can leak
-    into the archive (05 §4).
+    Since the server truncates every result file unconditionally at startup —
+    the optional ones included, whether or not their feature is on — "not empty"
+    here really does mean "written by this run"; no stale file can leak into the
+    archive (05 §4).
 
     Returns (destination, files_copied), or (None, 0) if archiving failed.
     Failure is non-fatal by design; the run still shuts down cleanly."""

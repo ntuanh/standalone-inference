@@ -35,8 +35,10 @@ Every chart here is built from the shared result format
 directory with **no chart-code changes** — that is the entire point of fixing the
 format.
 
-Runs are discovered under `results/`: every subdirectory holding a
-`batch_done_ns.log` is one run, named after its folder. Charts are written to
+Runs are discovered under `results/`, **at any depth**: every directory holding a
+`batch_done_ns.log` is one run, named after its folder. That covers both layouts
+`guide/05 §1` allows — `results/<run-id>/` as the archiver writes it, and
+`results/<date>/<variant>/` for a compared set. Charts are written to
 `results/imgs/`.
 
 | Input file | Feeds |
@@ -81,8 +83,17 @@ IMG_DIR = RESULTS / "imgs"
 IMG_DIR.mkdir(parents=True, exist_ok=True)
 
 # A run is any directory under results/ that holds the required system series.
-RUNS = {d.name: d for d in sorted(RESULTS.iterdir())
-        if d.is_dir() and (d / "batch_done_ns.log").exists()}
+# The search is RECURSIVE: guide/05 §1 allows both `results/<run-id>/` (what the
+# archiver writes) and `results/<date>/<variant>/` for a compared set, and a
+# one-level scan silently finds zero runs in the second layout.
+_SKIP = {"visual", "imgs"}
+_found = sorted(p.parent for p in RESULTS.rglob("batch_done_ns.log")
+                if not _SKIP & set(p.relative_to(RESULTS).parts))
+# Label by folder name, which is what the archiver makes unique; fall back to the
+# path relative to results/ only where two nested folders share a leaf name.
+_leaf = [d.name for d in _found]
+RUNS = {(d.name if _leaf.count(d.name) == 1 else d.relative_to(RESULTS).as_posix()): d
+        for d in _found}
 RUN_ORDER = list(RUNS)
 assert RUN_ORDER, f"no run directories found under {RESULTS}"
 print(f"ROOT    {ROOT}\nresults {RESULTS}\nimgs    {IMG_DIR}")
@@ -474,6 +485,16 @@ for k, df in D.items():
 CLUSTERS = [c for c in CLUSTER_LABEL.values()]
 SCOPES   = CLUSTERS + ["System"]
 print(f"\nclusters {CLUSTERS}")
+
+def first_run_with(df):
+    """The first run, in RUN_ORDER, that actually has rows in `df`.
+
+    Optional measurements (guide/10-12) are per-run: a directory can be complete
+    for throughput and carry an empty message_size.log because the feature was
+    off that day. A single-run chart that hardcodes RUN_ORDER[0] then fails on a
+    perfectly valid set of runs, so ask which run has the data instead."""
+    have = set(df.run) if len(df) else set()
+    return next((r for r in RUN_ORDER if r in have), None)
 ''')
 
 # ---------------------------------------------------------------- assertions
@@ -520,8 +541,33 @@ if len(svc) and len(pipe):
              if worst > 1.5 else "  (little buffering)"))
 
 MULTI_RUN = len(RUN_ORDER) > 1
-print(f"\n{len(RUN_ORDER)} run(s) loaded -> comparison charts "
-      f"{'enabled' if MULTI_RUN else 'skipped (C10 needs two runs)'}")
+
+# Grouped-bar geometry, derived from the run count rather than assumed. A width
+# fixed for two runs makes three of them wider than the category slot, and bars
+# from neighbouring categories then touch — which reads as one group and is the
+# kind of chart bug nobody questions, because bars are supposed to be adjacent.
+BAR_GAP = 0.03                              # surface-coloured gap, never a border
+BAR_W   = max(0.08, (0.82 - BAR_GAP * (len(RUN_ORDER) - 1)) / len(RUN_ORDER))
+bar_off = lambda i: (i - (len(RUN_ORDER) - 1) / 2) * (BAR_W + BAR_GAP)
+
+# Two runs are comparable only if they did the SAME amount of work (guide/05 §6);
+# otherwise the comparison bar reads as a configuration effect when it is really a
+# different workload, and no chart says so on its own. So pick the pair here, from
+# equal done/frames, rather than letting C10 take whichever two sort first.
+_tot = (df_rate[df_rate.scope == "System"].set_index("run")[["done", "frames"]]
+        .to_dict("index"))
+COMPARE_PAIR = next((
+    (a, b) for i, a in enumerate(RUN_ORDER) for b in RUN_ORDER[i + 1:]
+    if a in _tot and b in _tot and _tot[a] == _tot[b]), None)
+if COMPARE_PAIR:
+    print(f"\n{len(RUN_ORDER)} run(s) loaded -> C10 compares "
+          f"{COMPARE_PAIR[0]} vs {COMPARE_PAIR[1]} (identical done/frames)")
+elif MULTI_RUN:
+    print(f"\n{len(RUN_ORDER)} run(s) loaded -> C10 skipped: no two runs share a "
+          f"workload, so any comparison between them would be unlike-for-unlike "
+          f"(guide/05 §6)")
+else:
+    print("\n1 run loaded -> comparison charts skipped (C10 needs two)")
 ''')
 
 
@@ -540,10 +586,10 @@ chart("C1 · Throughput by cluster and system",
 piv = (df_rate.pivot_table(index="scope", columns="run", values="fps")
        .reindex(SCOPES).dropna(how="all"))[RUN_ORDER]
 
-x, width = np.arange(len(piv)), 0.36 if MULTI_RUN else 0.5
+x, width = np.arange(len(piv)), BAR_W
 fig, ax = plt.subplots(figsize=(8.2, 4.8))
 for i, run in enumerate(RUN_ORDER):
-    off = (i - (len(RUN_ORDER) - 1) / 2) * (width + 0.03)
+    off = bar_off(i)
     bars = ax.bar(x + off, piv[run], width, label=run,
                   color=RUN_COLOR[run], **BAR_KW)
     label_bars(ax, bars, fmt="{:.2f}")
@@ -574,16 +620,26 @@ ymax = (df_tl.window_fps.max() if len(df_tl) else 1.0) * 1.10
 
 for ax, run in zip(axes, RUN_ORDER):
     sub_run = df_tl[df_tl.run == run]
+    ends = []
     for j, cluster in enumerate(CLUSTERS):
         s = sub_run[sub_run.cluster == cluster].sort_values("done")
         if s.empty:
             continue
         colour = [S1, S2, S3, S4][j % 4]
         ax.plot(s.done, s.window_fps, color=colour, label=cluster, **LINE_KW)
-        last = s.iloc[-1]                       # selective label: endpoint only
-        ax.annotate(f"{last.window_fps:.1f}", xy=(last.done, last.window_fps),
-                    xytext=(6, 0), textcoords="offset points", va="center",
+        ends.append((s.iloc[-1].done, s.iloc[-1].window_fps, colour))
+
+    # Selective label: the endpoint only. Balanced clusters converge, so their
+    # end labels land on the same pixel and overprint into an unreadable smear —
+    # place them after the loop and step apart the ones that are too close.
+    ends.sort(key=lambda e: e[1])
+    dy, prev_y = 0, None
+    for x, y, colour in ends:
+        dy = dy + 11 if prev_y is not None and (y - prev_y) < ymax * 0.045 else 0
+        ax.annotate(f"{y:.1f}", xy=(x, y), xytext=(6, dy),
+                    textcoords="offset points", va="center",
                     fontsize=9, color=colour)
+        prev_y = y
     ax.set_title(run)
     ax.set_xlabel("Completed batches (per cluster)")
     ax.set_ylim(0, ymax)
@@ -636,12 +692,12 @@ for ci, cluster in enumerate(CLUSTERS):
         vals = df_tl[(df_tl.cluster == cluster) & (df_tl.run == run)].window_fps.values
         if not len(vals):
             continue
-        positions.append(ci + (ri - (len(RUN_ORDER) - 1) / 2) * 0.34)
+        positions.append(ci + bar_off(ri))
         data.append(vals)
         colours.append(RUN_COLOR[run])
 
 fig, ax = plt.subplots(figsize=(8.6, 4.9))
-bp = ax.boxplot(data, positions=positions, widths=0.28, patch_artist=True,
+bp = ax.boxplot(data, positions=positions, widths=BAR_W * 0.78, patch_artist=True,
                 showfliers=False,
                 medianprops=dict(color=SURFACE, linewidth=1.8),   # reads on the fill
                 whiskerprops=dict(color=AXIS, linewidth=1.0),
@@ -665,10 +721,12 @@ for pos, vals in zip(positions, data):
 lo, hi = ax.get_ylim()
 ax.set_ylim(lo, max(hi, max(caps) + (hi - lo) * 0.08))
 
-# ax.boxplot returns no legend handles — build Rectangle proxies.
+# ax.boxplot returns no legend handles — build Rectangle proxies. "best"
+# rather than a fixed corner: which corner is free depends on where the fastest
+# cluster lands, and a pinned legend covered a mean label in the render.
 if MULTI_RUN:
     ax.legend([plt.Rectangle((0, 0), 1, 1, color=RUN_COLOR[r]) for r in RUN_ORDER],
-              RUN_ORDER, loc="upper left")
+              RUN_ORDER, loc="best")
 ax.set_xticks(range(len(CLUSTERS)), CLUSTERS)
 ax.set_ylabel("Rolling window rate (frames/s)")
 ax.set_xlabel("Cluster")
@@ -693,7 +751,7 @@ else:
     fig, axes = plt.subplots(1, len(roles), figsize=(5.9 * len(roles), 4.8),
                              squeeze=False)          # NOT sharey — that is the point
     axes = axes[0]
-    x, width = np.arange(len(CLUSTERS)), 0.36 if MULTI_RUN else 0.5
+    x, width = np.arange(len(CLUSTERS)), BAR_W
     for ax, role in zip(axes, roles):
         piv = (svc[svc.role == role]
                .pivot_table(index="scope", columns="run", values="mean_ms")
@@ -701,7 +759,7 @@ else:
         for i, run in enumerate(RUN_ORDER):
             if run not in piv:
                 continue
-            off = (i - (len(RUN_ORDER) - 1) / 2) * (width + 0.03)
+            off = bar_off(i)
             b = ax.bar(x + off, piv[run], width, label=run,
                        color=RUN_COLOR[run], **BAR_KW)
             label_bars(ax, b, fmt="{:.2f}s")
@@ -734,7 +792,7 @@ else:
     fig, axes = plt.subplots(1, len(scopes), figsize=(4.9 * len(scopes), 4.8),
                              sharey=True, squeeze=False)
     axes = axes[0]
-    x, width = np.arange(len(stats)), 0.36 if MULTI_RUN else 0.5
+    x, width = np.arange(len(stats)), BAR_W
     ymax = np.nanmax(e2e[[c for c, _ in stats]].to_numpy()) / 1000.0
     # 24 bars want a short label, but "{:.0f}" on a 10-second e2e prints 13 and
     # 14 for 13.4 s and 13.7 s — the reader sees a gap that is not there. Pick
@@ -747,7 +805,7 @@ else:
             if run not in sub.index:
                 continue
             vals = [float(np.ravel(sub.loc[run, col])[0]) / 1000.0 for col, _ in stats]
-            off = (i - (len(RUN_ORDER) - 1) / 2) * (width + 0.03)
+            off = bar_off(i)
             b = ax.bar(x + off, vals, width, label=run, color=RUN_COLOR[run], **BAR_KW)
             label_bars(ax, b, fmt=e2e_fmt, fontsize=8.5)
         ax.set_xticks(x, [lbl for _, lbl in stats])
@@ -779,7 +837,7 @@ rows = [(s, r) for s, r in rows
 labels = [f"{s.replace('Cluster ', 'C')}\n{r}" for s, r in rows]
 
 idx = df_utg.set_index(["run", "scope", "role"])
-x, width = np.arange(len(rows)), 0.36 if MULTI_RUN else 0.5
+x, width = np.arange(len(rows)), BAR_W
 fig, ax = plt.subplots(figsize=(max(8.0, 1.5 * len(rows)), 4.9))
 
 for i, run in enumerate(RUN_ORDER):
@@ -790,9 +848,9 @@ for i, run in enumerate(RUN_ORDER):
             means.append(float(np.ravel(idx.loc[(run, s, r), "utilization_mean"])[0]))
         except KeyError:
             vals.append(np.nan); means.append(np.nan)
-    off = (i - (len(RUN_ORDER) - 1) / 2) * (width + 0.03)
+    off = bar_off(i)
     b = ax.bar(x + off, vals, width, label=run, color=RUN_COLOR[run], **BAR_KW)
-    label_bars(ax, b, fmt="{:.1f}%", fontsize=9)
+    label_bars(ax, b, fmt="{:.1f}%", fontsize=9 if len(RUN_ORDER) < 3 else 7.5)
     ax.plot(x + off, means, linestyle="none", marker="o", markersize=5,
             markerfacecolor=SURFACE, markeredgecolor=INK_2, markeredgewidth=1.3,
             label="mean of per-device ratios" if i == 0 else None)
@@ -898,10 +956,10 @@ chart("C10 · Run comparison — verdict bar",
       "also spelled out in text. Utilization is marked direction-neutral: lower "
       "utilization at higher throughput is a *better* system.",
       r'''
-if not MULTI_RUN:
-    print("only one run loaded — skipping C10 (a comparison needs two)")
+if COMPARE_PAIR is None:
+    print("skipping C10 — no pair of runs with the same workload to compare")
 else:
-    A, B = RUN_ORDER[0], RUN_ORDER[1]
+    A, B = COMPARE_PAIR
     def one(df, mask, col):
         v = df[mask][col]
         return float(v.iloc[0]) if len(v) else np.nan
@@ -982,10 +1040,10 @@ chart("C12 · Free time by device — where the run went",
       "on another lane counts as nothing there and busy here. Every bar is the same "
       "height because every bar is that device's whole run.",
       r'''
-if df_ftd.empty:
+run = first_run_with(df_ftd)
+if run is None:
     print("no free-time reports — skipping C12 (feature disabled, or no device reported)")
 else:
-    run = RUN_ORDER[0]
     sub = (df_ftd[df_ftd.run == run]
            .sort_values(["role", "free"], ascending=[True, False]).reset_index(drop=True))
     pos = np.arange(len(sub))
@@ -1052,10 +1110,10 @@ chart("C13 · When each device was idle",
       "dip names the stage that stalled. Sequential ramp — one hue, light→dark, "
       "never a rainbow.",
       r'''
-if df_fts.empty:
+run = first_run_with(df_fts)
+if run is None:
     print("no free-time series — skipping C13")
 else:
-    run = RUN_ORDER[0]
     sub = df_fts[df_fts.run == run]
     order = sub.drop_duplicates("client").sort_values(["role", "client"])
     piv = (sub.pivot_table(index="client", columns="i", values="free")
@@ -1100,11 +1158,11 @@ chart("C14 · Broker host memory over the run",
       "signature, and it is unmistakable once the two curves are stacked. `used` is "
       "`MemTotal − MemAvailable`; the phase bands are the idle / run / tail marks.",
       r'''
-if df_ram.empty:
+run = first_run_with(df_ram)
+if run is None:
     print("no broker RAM samples — skipping C14 (feature disabled, or the host "
           "was unreachable; broker_ram.log records the reason)")
 else:
-    run = RUN_ORDER[0]
     sub = df_ram[df_ram.run == run].sort_values("ts")
     t0 = int(sub.ts.iloc[0])
     t = (sub.ts - t0) / 1e9
@@ -1171,11 +1229,11 @@ chart("C15 · Payload size on the wire",
       "the payload depends on the scene, which makes any single-number bandwidth "
       "estimate optimistic.",
       r'''
-if df_msz.empty:
+run = first_run_with(df_msz)
+if run is None:
     print("no message-size samples — skipping C15 (feature disabled, or the "
           "chosen worker published nothing)")
 else:
-    run = RUN_ORDER[0]
     s = df_msz[df_msz.run == run].sort_values("t_offset_s")
     summary = df_mszs[df_mszs.run == run]
 
